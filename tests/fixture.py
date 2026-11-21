@@ -45,6 +45,7 @@ def model(request):
         return {"choices": [{"message": {"content": "Thinking fixture passed"}}],
                 "usage": {"prompt_tokens": 120, "completion_tokens": 8, "total_tokens": 128}}
     assert "reasoning_effort" not in request
+    assert "You are Pluto" in request["messages"][0]["content"]
     names = [tool["function"]["name"] for tool in request["tools"]]
     messages = [item for item in request["messages"] if item["role"] == "tool"]
     assert "Notes for the fixture" in request["messages"][0]["content"]
