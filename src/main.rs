@@ -870,7 +870,7 @@ impl eframe::App for Desktop {
                                         RichText::new(if role == "user" {
                                             "You"
                                         } else {
-                                            "Assistant"
+                                            APP_NAME
                                         })
                                         .strong()
                                         .color(ui.visuals().hyperlink_color),
