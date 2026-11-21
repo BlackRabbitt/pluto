@@ -2,7 +2,7 @@ use crate::providers::{Connection, Provider};
 use anyhow::{Context, Result, bail, ensure};
 use rmcp::{
     RoleClient, ServiceExt,
-    model::CallToolRequestParam,
+    model::{CallToolRequestParam, Tool},
     service::RunningService,
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
@@ -212,6 +212,22 @@ impl Config {
         }
     }
 
+    pub fn set_mcp_server(&mut self, name: &str, server: Option<Mcp>) -> Result<()> {
+        if let Some(server) = server {
+            ensure!(
+                valid_name(name),
+                "Use letters, numbers, hyphens, or underscores for the server name"
+            );
+            server.validate()?;
+            self.mcp.insert(name.to_owned(), server);
+        } else {
+            self.mcp.remove(name);
+        }
+        self.mcp_approvals
+            .retain(|rule| rule.server != name || self.mcp.get(name) == Some(&rule.connection));
+        Ok(())
+    }
+
     pub fn model_connection(&self) -> Result<Connection> {
         Connection::new(
             self.model_provider.context("Choose a model provider")?,
@@ -244,8 +260,11 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        let path = Self::path()?;
-        match fs::read_to_string(&path) {
+        Self::load_from(&Self::path()?)
+    }
+
+    fn load_from(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path) {
             Ok(text) => {
                 let mut config: Self =
                     toml::from_str(&text).with_context(|| format!("Invalid {}", path.display()))?;
@@ -260,7 +279,10 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
+        self.save_to(&Self::path()?)
+    }
+
+    fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
@@ -335,6 +357,24 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Mcp {
+    async fn discover(&self) -> Result<(RunningService<RoleClient, ()>, Vec<Tool>)> {
+        timeout(Duration::from_secs(12), async {
+            let client = self.connect().await?;
+            let tools = client.list_all_tools().await?;
+            Ok((client, tools))
+        })
+        .await
+        .context("MCP connection or tool discovery timed out")?
+    }
+
+    pub async fn test_connection(&self) -> Result<Vec<String>> {
+        let (_client, tools) = self.discover().await?;
+        Ok(tools
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect())
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Stdio { command, .. } => {
@@ -373,7 +413,10 @@ impl Mcp {
             Self::Stdio { command, args } => {
                 let mut process = Command::new(command);
                 process.args(args);
-                Ok(().serve(TokioChildProcess::new(process)?).await?)
+                let transport = TokioChildProcess::new(process).context(
+                    "Could not start the local MCP process. Check its launch command and PATH",
+                )?;
+                Ok(().serve(transport).await?)
             }
             Self::Http { url, token_env } => {
                 let mut options = StreamableHttpClientTransportConfig::with_uri(url.as_str());
@@ -480,17 +523,7 @@ impl<'a> ToolSet<'a> {
         let mut requests = tokio::task::JoinSet::new();
         for (name, entry) in &config.mcp {
             let (name, entry) = (name.clone(), entry.clone());
-            requests.spawn(async move {
-                let result = timeout(Duration::from_secs(12), async {
-                    let client = entry.connect().await?;
-                    let tools = client.list_all_tools().await?;
-                    Ok::<_, anyhow::Error>((client, tools))
-                })
-                .await
-                .context("Discovery timed out")
-                .and_then(|result| result);
-                (name, result)
-            });
+            requests.spawn(async move { (name, entry.discover().await) });
         }
         let mut discovered = BTreeMap::new();
         while let Some(result) = requests.join_next().await {
@@ -707,6 +740,51 @@ async fn run_process(workspace: &Path, executable: &str, args: &[String]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_changes_require_an_explicit_save() -> Result<()> {
+        let directory =
+            env::temp_dir().join(format!("pluto-mcp-settings-test-{}", std::process::id()));
+        fs::create_dir(&directory)?;
+        let path = directory.join("tools.toml");
+        let result = (|| -> Result<()> {
+            let mut config = Config {
+                model_name: "Existing model".into(),
+                ..Config::default()
+            };
+            config.save_to(&path)?;
+            let server = Mcp::Stdio {
+                command: "python3".into(),
+                args: vec!["fixture.py".into(), "stdio".into()],
+            };
+            config.set_mcp_server("fixture", Some(server.clone()))?;
+            assert!(Config::load_from(&path)?.mcp.is_empty());
+            config.save_to(&path)?;
+            let mut reopened = Config::load_from(&path)?;
+            assert_eq!(reopened.model_name, "Existing model");
+            assert!(reopened.mcp.get("fixture") == Some(&server));
+
+            let approval = ApprovalRule::Mcp(McpApproval {
+                server: "fixture".into(),
+                tool: "lookup".into(),
+                connection: server,
+            });
+            reopened.remember_approval(approval.clone());
+            reopened.save_to(&path)?;
+            assert!(Config::load_from(&path)?.permits(&approval));
+
+            reopened.set_mcp_server("fixture", None)?;
+            assert!(Config::load_from(&path)?.permits(&approval));
+            reopened.save_to(&path)?;
+            let reopened = Config::load_from(&path)?;
+            assert!(reopened.mcp.is_empty());
+            assert!(reopened.mcp_approvals.is_empty());
+            assert_eq!(reopened.model_name, "Existing model");
+            Ok(())
+        })();
+        fs::remove_dir_all(directory)?;
+        result
+    }
 
     #[test]
     fn saved_mcp_approval_is_specific_to_the_tool_and_server() -> Result<()> {

@@ -218,6 +218,9 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
             token_env: String::new(),
         },
     );
+    for server in config.mcp.values() {
+        assert_eq!(server.test_connection().await?, ["lookup"]);
+    }
 
     let approvals = std::cell::RefCell::new(Vec::new());
     let statuses = std::cell::RefCell::new(Vec::new());

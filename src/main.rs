@@ -8,7 +8,7 @@ mod tools;
 mod chat_test;
 
 use agent::{ApprovalDecision, Event, TokenUsage};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use history::{ChatEntry, ChatStore, Messages};
@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
-use tools::{ApprovalRequest, ApprovalRule, Config, Mcp, valid_name};
+use tools::{ApprovalRequest, ApprovalRule, Config, Mcp};
 
 const APP_NAME: &str = "Pluto";
 
@@ -146,6 +146,12 @@ struct PendingApproval {
     error: Option<String>,
 }
 
+struct McpConnectionTest {
+    name: Option<String>,
+    server: Mcp,
+    result: Lookup<Vec<String>>,
+}
+
 struct Desktop {
     runtime: tokio::runtime::Runtime,
     events: mpsc::Receiver<Event>,
@@ -179,6 +185,8 @@ struct Desktop {
     mcp_http: bool,
     mcp_address: String,
     mcp_details: String,
+    mcp_notice: Option<Result<String>>,
+    mcp_test: Option<McpConnectionTest>,
 }
 
 impl Desktop {
@@ -257,6 +265,8 @@ impl Desktop {
             mcp_http: true,
             mcp_address: String::new(),
             mcp_details: String::new(),
+            mcp_notice: None,
+            mcp_test: None,
         })
     }
 
@@ -373,18 +383,23 @@ impl Desktop {
             return;
         }
         let result = (|| -> anyhow::Result<()> {
-            self.config.workspace = Path::new(self.workspace.trim()).canonicalize()?;
-            anyhow::ensure!(
-                self.config.workspace.is_dir(),
-                "Workspace must be a directory"
-            );
-            if self.config.model_provider.is_some() {
-                self.config.model_connection()?;
+            let mut saved = self.config.clone();
+            let workspace = self.workspace.trim();
+            if !workspace.is_empty() {
+                let path = Path::new(workspace);
+                saved.workspace = path.canonicalize().unwrap_or_else(|_| path.to_owned());
             }
-            self.config.save()
+            saved
+                .save()
+                .context("Could not write Pluto's settings file")?;
+            self.config = saved;
+            Ok(())
         })();
         self.notice = match result {
-            Ok(()) => "Settings saved".into(),
+            Ok(()) => {
+                self.mcp_notice = None;
+                "Settings saved".into()
+            }
             Err(error) => format!("Could not save: {error:#}"),
         };
     }
@@ -727,10 +742,9 @@ impl Desktop {
         });
     }
 
-    fn add_mcp(&mut self) {
-        let name = self.mcp_name.trim().to_owned();
+    fn mcp_draft(&self) -> Mcp {
         let target = self.mcp_address.trim().to_owned();
-        let server = if self.mcp_http {
+        if self.mcp_http {
             Mcp::Http {
                 url: target,
                 token_env: self.mcp_details.trim().into(),
@@ -745,18 +759,60 @@ impl Desktop {
                     .map(str::to_owned)
                     .collect(),
             }
-        };
-        if !valid_name(&name) {
-            self.notice =
-                "Use letters, numbers, hyphens, or underscores for the server name.".into();
-        } else if let Err(error) = server.validate() {
-            self.notice = format!("{error:#}");
-        } else {
-            self.config.mcp.insert(name, server);
-            self.mcp_name.clear();
-            self.mcp_address.clear();
-            self.mcp_details.clear();
-            self.notice = "MCP server added. Save settings to keep it across restarts.".into();
+        }
+    }
+
+    fn add_mcp(&mut self, server: Mcp) -> Result<String> {
+        let name = self.mcp_name.trim().to_owned();
+        self.config.set_mcp_server(&name, Some(server))?;
+        if let Some(test) = &mut self.mcp_test
+            && test.name.is_none()
+            && self.config.mcp.get(&name) == Some(&test.server)
+        {
+            test.name = Some(name.clone());
+        }
+        self.mcp_name.clear();
+        self.mcp_address.clear();
+        self.mcp_details.clear();
+        Ok(format!("Added {name}. Click Save settings to keep it."))
+    }
+
+    fn start_mcp_test(&mut self, context: &egui::Context, name: Option<String>, server: Mcp) {
+        let mut result = Lookup::Idle;
+        let connection = server.clone();
+        result.start(&self.runtime, context, async move {
+            connection.test_connection().await
+        });
+        self.mcp_test = Some(McpConnectionTest {
+            name,
+            server,
+            result,
+        });
+    }
+
+    fn mcp_test_status(&self, ui: &mut egui::Ui, name: Option<&str>, server: &Mcp) {
+        let Some(test) = &self.mcp_test else { return };
+        if test.name.as_deref() != name || &test.server != server {
+            return;
+        }
+        match &test.result {
+            Lookup::Idle => {}
+            Lookup::Loading(_) => {
+                ui.label("Testing connection…");
+            }
+            Lookup::Complete(Ok(tools)) => {
+                ui.label(format!("Connected · {} tools found", tools.len()));
+                if !tools.is_empty() {
+                    let names = tools[..tools.len().min(6)].join(", ");
+                    ui.label(RichText::new(names).weak());
+                }
+            }
+            Lookup::Complete(Err(error)) => {
+                ui.label(
+                    RichText::new(format!("Connection failed: {error:#}"))
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
         }
     }
 
@@ -814,6 +870,11 @@ impl Desktop {
         ui.separator();
         ui.heading("MCP servers");
         let mut remove = None;
+        let mut test_request = None;
+        let testing = self
+            .mcp_test
+            .as_ref()
+            .is_some_and(|test| matches!(test.result, Lookup::Loading(_)));
         for (name, server) in &self.config.mcp {
             ui.horizontal(|ui| {
                 let target = match server {
@@ -821,13 +882,27 @@ impl Desktop {
                     Mcp::Stdio { command, .. } => command,
                 };
                 ui.label(RichText::new(name).strong()).on_hover_text(target);
+                if ui
+                    .add_enabled(!testing, egui::Button::new("Test"))
+                    .clicked()
+                {
+                    test_request = Some((name.clone(), server.clone()));
+                }
                 if ui.small_button("Remove").clicked() {
                     remove = Some(name.clone());
                 }
             });
+            self.mcp_test_status(ui, Some(name), server);
+        }
+        if let Some((name, server)) = test_request {
+            self.start_mcp_test(ui.ctx(), Some(name), server);
         }
         if let Some(name) = remove {
-            self.config.mcp.remove(&name);
+            self.mcp_notice = Some(
+                self.config
+                    .set_mcp_server(&name, None)
+                    .map(|()| format!("Removed {name}. Click Save settings to keep the change.")),
+            );
         }
         ui.horizontal(|ui| {
             if ui.selectable_label(self.mcp_http, "Remote HTTP").clicked() && !self.mcp_http {
@@ -873,8 +948,26 @@ impl Desktop {
                     .desired_rows(3),
             );
         }
-        if ui.button("Add MCP server").clicked() {
-            self.add_mcp();
+        let draft = self.mcp_draft();
+        ui.horizontal(|ui| {
+            if ui.button("Add MCP server").clicked() {
+                self.mcp_notice = Some(self.add_mcp(draft.clone()));
+            }
+            if ui
+                .add_enabled(!testing, egui::Button::new("Test connection"))
+                .clicked()
+            {
+                self.start_mcp_test(ui.ctx(), None, draft.clone());
+            }
+        });
+        self.mcp_test_status(ui, None, &draft);
+        if let Some(notice) = &self.mcp_notice {
+            match notice {
+                Ok(message) => ui.label(message),
+                Err(error) => {
+                    ui.label(RichText::new(format!("{error:#}")).color(ui.visuals().warn_fg_color))
+                }
+            };
         }
     }
 }
@@ -892,6 +985,9 @@ impl eframe::App for Desktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.models.poll();
         self.capabilities.poll();
+        if let Some(test) = &mut self.mcp_test {
+            test.result.poll();
+        }
         self.sync_discovery();
         while let Ok(event) = self.events.try_recv() {
             match event {

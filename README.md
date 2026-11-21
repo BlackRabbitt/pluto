@@ -78,7 +78,7 @@ In **Settings → MCP servers**, select a transport and enter the server details
 - **Local process** uses stdio. Enter the launch command and one argument per line. The command must be installed separately.
 - **Remote HTTP** uses Streamable HTTP. Enter the MCP endpoint URL and, when required, the name of an environment variable holding its bearer token. Set the variable before launching the app.
 
-Select **Add MCP server** and save. Chat discovers each server's tools and shows any connection errors. The app asks for approval before calling a tool. Install or authorize the server using its own instructions.
+Use **Test connection** to check the form, or **Test** next to an existing entry. Pluto connects and lists the tools it finds. Select **Add MCP server**, then **Save settings** to keep the entry. When you send a message, Chat discovers each server's tools and asks for approval before calling a tool. Install or authorize the server using its own instructions.
 
 Choose **Run always** to approve future calls to that specific tool on the same server configuration, including calls with different arguments. Matching calls show **Auto-approved** in Chat. Use **Settings → Saved approvals** to forget an approval.
 
