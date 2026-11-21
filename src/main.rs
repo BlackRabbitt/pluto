@@ -173,6 +173,7 @@ struct Desktop {
     markdown_cache: CommonMarkCache,
     chat_store: Option<ChatStore>,
     saved_chats: Vec<ChatEntry>,
+    archived_chats: Vec<ChatEntry>,
     active_chat: Option<PathBuf>,
     chat_dirty: bool,
     history_notice: Option<String>,
@@ -212,6 +213,7 @@ impl Desktop {
             Err(error) => (None, Some(format!("Chat history unavailable: {error:#}"))),
         };
         let mut saved_chats = Vec::new();
+        let mut archived_chats = Vec::new();
         let mut restored = None;
         if let Some(store) = &chat_store {
             match store.entries() {
@@ -232,6 +234,18 @@ impl Desktop {
                         });
                 }
                 Err(error) => history_notice = Some(format!("{error:#}")),
+            }
+            match store.archived_entries() {
+                Ok((entries, skipped)) => {
+                    archived_chats = entries;
+                    if skipped > 0 {
+                        history_notice =
+                            Some(format!("Could not read {skipped} archived chat file(s)."));
+                    }
+                }
+                Err(error) => {
+                    history_notice = Some(format!("Could not load archived chats: {error:#}"))
+                }
             }
         }
         let (active_chat, history) = match restored {
@@ -260,6 +274,7 @@ impl Desktop {
             markdown_cache: CommonMarkCache::default(),
             chat_store,
             saved_chats,
+            archived_chats,
             active_chat,
             chat_dirty: false,
             history_notice,
@@ -282,7 +297,7 @@ impl Desktop {
     }
 
     fn send(&mut self, context: &egui::Context) {
-        if self.busy || self.prompt.trim().is_empty() {
+        if self.busy || self.prompt.trim().is_empty() || self.active_chat_is_archived() {
             return;
         }
         if self.config.model_connection().is_err() || self.config.model_name.trim().is_empty() {
@@ -438,6 +453,10 @@ impl Desktop {
     }
 
     fn composer_ui(&mut self, ui: &mut egui::Ui) {
+        if self.active_chat_is_archived() {
+            ui.label(RichText::new("Archived chat · Restore it to continue").weak());
+            return;
+        }
         let input_id = ui.make_persistent_id("chat_composer");
         if let Some(selection) = &self.selection {
             let clear = ui
@@ -542,32 +561,81 @@ impl Desktop {
     }
 
     fn saved_chats_ui(&mut self, ui: &mut egui::Ui) {
-        if self.saved_chats.is_empty() {
+        if self.saved_chats.is_empty() && self.archived_chats.is_empty() {
             return;
         }
         ui.separator();
-        ui.label(RichText::new("Recent chats").weak().small());
         let max_height = (ui.available_height() - 42.0).max(0.0);
         let mut selected = None;
+        let mut chat_list = |ui: &mut egui::Ui, chats: &[ChatEntry]| {
+            for chat in chats {
+                let active = !self.settings && self.active_chat.as_ref() == Some(&chat.path);
+                if ui
+                    .add(egui::Button::selectable(active, &chat.title).truncate())
+                    .on_hover_text(&chat.title)
+                    .clicked()
+                {
+                    selected = Some(chat.path.clone());
+                }
+            }
+        };
         egui::ScrollArea::vertical()
             .max_height(max_height)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!self.busy, |ui| {
-                    for chat in &self.saved_chats {
-                        let active =
-                            !self.settings && self.active_chat.as_ref() == Some(&chat.path);
-                        if ui
-                            .add(egui::Button::selectable(active, &chat.title).truncate())
-                            .on_hover_text(&chat.title)
-                            .clicked()
-                        {
-                            selected = Some(chat.path.clone());
-                        }
+                    if !self.saved_chats.is_empty() {
+                        ui.label(RichText::new("Recent chats").weak().small());
+                        chat_list(ui, &self.saved_chats);
+                    }
+                    if !self.archived_chats.is_empty() {
+                        egui::CollapsingHeader::new("Archived chats")
+                            .show(ui, |ui| chat_list(ui, &self.archived_chats));
                     }
                 });
             });
         if let Some(path) = selected {
             self.open_chat(Some(path));
+        }
+    }
+
+    fn active_chat_is_archived(&self) -> bool {
+        self.chat_store
+            .as_ref()
+            .zip(self.active_chat.as_deref())
+            .is_some_and(|(store, path)| store.is_archived(path))
+    }
+
+    fn move_active_chat(&mut self) {
+        if self.busy || !self.persist_chat() {
+            return;
+        }
+        let Some((store, path)) = self.chat_store.as_ref().zip(self.active_chat.as_deref()) else {
+            return;
+        };
+        let restoring = store.is_archived(path);
+        let (source, destination) = if restoring {
+            (&mut self.archived_chats, &mut self.saved_chats)
+        } else {
+            (&mut self.saved_chats, &mut self.archived_chats)
+        };
+        let Some(index) = source.iter().position(|entry| entry.path == path) else {
+            return;
+        };
+        let moved = if restoring {
+            store.restore(path)
+        } else {
+            store.archive(path)
+        };
+        match moved {
+            Ok(new_path) => {
+                let mut entry = source.remove(index);
+                entry.path = new_path.clone();
+                destination.insert(0, entry);
+                self.active_chat = Some(new_path);
+                self.picker_catalog = Lookup::Idle;
+                self.history_notice = None;
+            }
+            Err(error) => self.history_notice = Some(format!("{error:#}")),
         }
     }
 
@@ -1255,6 +1323,19 @@ impl eframe::App for Desktop {
                 {
                     self.open_chat(None);
                 }
+                if !self.settings && self.active_chat.is_some() {
+                    let label = if self.active_chat_is_archived() {
+                        "Restore chat"
+                    } else {
+                        "Archive chat"
+                    };
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new(label))
+                        .clicked()
+                    {
+                        self.move_active_chat();
+                    }
+                }
                 self.saved_chats_ui(ui);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     let counts = format!(
@@ -1282,7 +1363,9 @@ impl eframe::App for Desktop {
                         self.persist_chat();
                     }
                 }
-                let composer_space = if self.picker_query().is_some() {
+                let composer_space = if self.active_chat_is_archived() {
+                    40.0
+                } else if self.picker_query().is_some() {
                     245.0
                 } else if self.selection.is_some() {
                     138.0

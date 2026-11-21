@@ -39,6 +39,8 @@ channel = "1.100.0"
 
 Open a saved conversation from **Recent chats** in the sidebar or select **New chat** to start another one. The app reopens the most recently updated chat on launch. Sent messages and completed replies are saved as plain JSON in a `chats` folder beside `tools.toml`.
 
+Open a saved conversation and click **Archive chat** to move its file into `chats/archive`. Open it under **Archived chats** to read it, or click **Restore chat** to move it back and continue the conversation.
+
 ## Add a skill and use a CLI
 
 1. Install the app's CLI independently and make sure the command is on the PATH inherited by Pluto.

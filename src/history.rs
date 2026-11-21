@@ -48,7 +48,53 @@ impl ChatStore {
     }
 
     pub fn entries(&self) -> Result<(Vec<ChatEntry>, usize)> {
-        let paths = match fs::read_dir(&self.directory) {
+        Self::entries_in(&self.directory)
+    }
+
+    fn archive_directory(&self) -> PathBuf {
+        self.directory.join("archive")
+    }
+
+    pub fn archived_entries(&self) -> Result<(Vec<ChatEntry>, usize)> {
+        Self::entries_in(&self.archive_directory())
+    }
+
+    pub fn is_archived(&self, path: &Path) -> bool {
+        path.parent() == Some(self.archive_directory().as_path())
+    }
+
+    pub fn archive(&self, path: &Path) -> Result<PathBuf> {
+        Self::move_chat(path, &self.directory, &self.archive_directory())
+            .context("Could not archive chat")
+    }
+
+    pub fn restore(&self, path: &Path) -> Result<PathBuf> {
+        Self::move_chat(path, &self.archive_directory(), &self.directory)
+            .context("Could not restore chat")
+    }
+
+    fn move_chat(path: &Path, source: &Path, destination: &Path) -> Result<PathBuf> {
+        ensure!(
+            path.parent() == Some(source)
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                && fs::symlink_metadata(path)?.is_file(),
+            "Expected a saved conversation file"
+        );
+        fs::create_dir_all(destination)?;
+        let target = destination.join(path.file_name().context("Missing chat filename")?);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => anyhow::bail!("A chat with this filename already exists"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::rename(path, &target)?;
+        Ok(target)
+    }
+
+    fn entries_in(directory: &Path) -> Result<(Vec<ChatEntry>, usize)> {
+        let paths = match fs::read_dir(directory) {
             Ok(paths) => paths,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
             Err(error) => return Err(error).context("Could not open the chat history folder"),
@@ -106,7 +152,13 @@ impl ChatStore {
     pub fn save(&self, path: Option<&Path>, messages: &[(String, String)]) -> Result<ChatEntry> {
         fs::create_dir_all(&self.directory).context("Could not create the chat history folder")?;
         let path = match path {
-            Some(path) => path.to_owned(),
+            Some(path) => {
+                ensure!(
+                    path.parent() == Some(self.directory.as_path()),
+                    "Restore the chat before editing it"
+                );
+                path.to_owned()
+            }
             None => self.directory.join(format!("{}.json", unique_id()?)),
         };
         let title = messages
@@ -191,6 +243,27 @@ mod tests {
         assert_eq!(skipped, 1);
         assert_eq!(reopened.read(&first_entry.path)?, first);
         assert_eq!(reopened.read(&second_entry.path)?, second);
+
+        let original = fs::read(&first_entry.path)?;
+        let archive = reopened.archive(&first_entry.path)?;
+        let reopened = ChatStore::beside(&config);
+        assert!(reopened.is_archived(&archive));
+        assert_eq!(reopened.entries()?.0.len(), 1);
+        assert_eq!(reopened.archived_entries()?.0[0].path, archive);
+        assert_eq!(fs::read(&archive)?, original);
+        assert!(reopened.save(Some(&archive), &first).is_err());
+
+        fs::write(&first_entry.path, b"existing file")?;
+        assert!(reopened.restore(&archive).is_err());
+        assert_eq!(fs::read(&archive)?, original);
+        assert_eq!(fs::read(&first_entry.path)?, b"existing file");
+        fs::remove_file(&first_entry.path)?;
+
+        let restored = reopened.restore(&archive)?;
+        assert_eq!(restored, first_entry.path);
+        assert_eq!(fs::read(&restored)?, original);
+        assert!(reopened.archived_entries()?.0.is_empty());
+        assert_eq!(reopened.entries()?.0.len(), 2);
         Ok(())
     }
 }
