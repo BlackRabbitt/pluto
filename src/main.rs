@@ -7,7 +7,7 @@ mod tools;
 #[path = "../tests/support/chat.rs"]
 mod chat_test;
 
-use agent::{ApprovalDecision, Event, TokenUsage};
+use agent::{ApprovalDecision, Event, TokenUsage, TurnSelection};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
-use tools::{ApprovalRequest, ApprovalRule, Config, Mcp};
+use tools::{ApprovalRequest, ApprovalRule, Config, Mcp, McpToolId, ToolSet};
 
 const APP_NAME: &str = "Pluto";
 
@@ -152,6 +152,11 @@ struct McpConnectionTest {
     result: Lookup<Vec<String>>,
 }
 
+struct PickerCatalog {
+    tools: Vec<McpToolId>,
+    warnings: Vec<String>,
+}
+
 struct Desktop {
     runtime: tokio::runtime::Runtime,
     events: mpsc::Receiver<Event>,
@@ -172,6 +177,9 @@ struct Desktop {
     chat_dirty: bool,
     history_notice: Option<String>,
     prompt: String,
+    selection: Option<TurnSelection>,
+    picker_catalog: Lookup<PickerCatalog>,
+    picker_index: usize,
     settings: bool,
     busy: bool,
     status: String,
@@ -256,6 +264,9 @@ impl Desktop {
             chat_dirty: false,
             history_notice,
             prompt: String::new(),
+            selection: None,
+            picker_catalog: Lookup::Idle,
+            picker_index: 0,
             busy: false,
             status: String::new(),
             connection_errors: Vec::new(),
@@ -289,6 +300,7 @@ impl Desktop {
         let config = self.config.clone();
         let history = self.history.clone();
         let thinking = self.thinking_setting.clone();
+        let selection = self.selection.take();
         let sender = self.sender.clone();
         let context = context.clone();
         self.runtime.spawn(async move {
@@ -296,9 +308,189 @@ impl Desktop {
                 let _ = sender.send(event);
                 context.request_repaint();
             };
-            let result = agent::chat(config, history, thinking, emit).await;
+            let result = agent::chat(config, history, thinking, selection, emit).await;
             emit(Event::Finished(result));
         });
+    }
+
+    fn picker_query(&self) -> Option<&str> {
+        if self.busy || self.selection.is_some() {
+            return None;
+        }
+        self.prompt
+            .strip_prefix('/')
+            .filter(|query| !query.contains(['/', '\n', '\r']))
+    }
+
+    fn picker_choices(&self, query: &str) -> Vec<TurnSelection> {
+        let query = query.to_lowercase();
+        let matches = |label: &str| {
+            let label = label.to_lowercase();
+            query.split_whitespace().all(|word| label.contains(word))
+        };
+        let mut choices: Vec<_> = self
+            .config
+            .skills
+            .keys()
+            .filter(|name| matches(name))
+            .cloned()
+            .map(TurnSelection::Skill)
+            .collect();
+        if let Lookup::Complete(Ok(catalog)) = &self.picker_catalog {
+            choices.extend(
+                catalog
+                    .tools
+                    .iter()
+                    .cloned()
+                    .map(TurnSelection::Mcp)
+                    .filter(|selection| matches(&selection.label())),
+            );
+        }
+        choices
+    }
+
+    fn picker_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        input: egui::Id,
+        previous: bool,
+        next: bool,
+        select: bool,
+    ) {
+        if matches!(self.picker_catalog, Lookup::Idle) && !self.config.mcp.is_empty() {
+            let config = self.config.clone();
+            self.picker_catalog
+                .start(&self.runtime, ui.ctx(), async move {
+                    let mut warnings = Vec::new();
+                    let tools = ToolSet::connect(&config, |warning| warnings.push(warning))
+                        .await
+                        .mcp_tool_choices();
+                    Ok(PickerCatalog { tools, warnings })
+                });
+        }
+        let choices = self.picker_choices(self.picker_query().unwrap_or_default());
+        if previous {
+            self.picker_index = self.picker_index.saturating_sub(1);
+        } else if next {
+            self.picker_index = self.picker_index.saturating_add(1);
+        }
+        self.picker_index = self.picker_index.min(choices.len().saturating_sub(1));
+        let mut picked = if select {
+            choices.get(self.picker_index).cloned()
+        } else {
+            None
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("composer_picker")
+            .max_height(155.0)
+            .show(ui, |ui| {
+                let mut current_group = "";
+                for (index, choice) in choices.iter().enumerate() {
+                    let group = match choice {
+                        TurnSelection::Skill(_) => "Skills",
+                        TurnSelection::Mcp(_) => "MCP tools",
+                    };
+                    if group != current_group {
+                        ui.label(RichText::new(group).small().strong());
+                        current_group = group;
+                    }
+                    let selected = index == self.picker_index;
+                    let row = ui.selectable_label(selected, choice.label());
+                    if row.clicked() {
+                        picked = Some(choice.clone());
+                    }
+                    if selected && (previous || next) {
+                        row.scroll_to_me(None);
+                    }
+                }
+                match &self.picker_catalog {
+                    Lookup::Loading(_) => {
+                        ui.label("Looking up MCP tools…");
+                    }
+                    Lookup::Complete(Ok(catalog)) => {
+                        for warning in &catalog.warnings {
+                            ui.label(
+                                RichText::new(warning)
+                                    .small()
+                                    .color(ui.visuals().warn_fg_color),
+                            );
+                        }
+                    }
+                    Lookup::Complete(Err(error)) => {
+                        ui.label(
+                            RichText::new(format!("{error:#}"))
+                                .small()
+                                .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                    Lookup::Idle => {}
+                }
+                if choices.is_empty() && !matches!(self.picker_catalog, Lookup::Loading(_)) {
+                    ui.label("No matching skills or MCP tools");
+                }
+            });
+        if let Some(selection) = picked {
+            self.selection = Some(selection);
+            self.prompt.clear();
+            self.picker_catalog = Lookup::Idle;
+            ui.memory_mut(|memory| memory.request_focus(input));
+        }
+    }
+
+    fn composer_ui(&mut self, ui: &mut egui::Ui) {
+        let input_id = ui.make_persistent_id("chat_composer");
+        if let Some(selection) = &self.selection {
+            let clear = ui
+                .horizontal(|ui| {
+                    ui.label(format!("For this message · {}", selection.label()));
+                    ui.small_button("Clear selection").clicked()
+                })
+                .inner;
+            if clear {
+                self.selection = None;
+                ui.memory_mut(|memory| memory.request_focus(input_id));
+            }
+        }
+        let mut keys = (false, false, false, false);
+        if self.picker_query().is_some() && ui.memory(|memory| memory.has_focus(input_id)) {
+            keys = ui.input_mut(|input| {
+                (
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                )
+            });
+        }
+        let (previous, next, select, cancel) = keys;
+        if cancel {
+            self.prompt.clear();
+        }
+        let input = ui.add_enabled(
+            !self.busy,
+            TextEdit::multiline(&mut self.prompt)
+                .id(input_id)
+                .hint_text("Message Pluto or type / to pick a tool")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        if input.changed() {
+            self.picker_index = 0;
+        }
+        if self.picker_query().is_some() {
+            self.picker_ui(ui, input_id, previous, next, select);
+            return;
+        }
+        self.picker_catalog = Lookup::Idle;
+        let keyboard = input.has_focus()
+            && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
+        if ui
+            .add_enabled(!self.busy, egui::Button::new("Send"))
+            .clicked()
+            || keyboard
+        {
+            self.send(ui.ctx());
+        }
     }
 
     fn persist_chat(&mut self) -> bool {
@@ -341,6 +533,7 @@ impl Desktop {
             Vec::new()
         };
         self.active_chat = path;
+        self.selection = None;
         self.history = history;
         self.context_usage = None;
         self.status.clear();
@@ -985,6 +1178,7 @@ impl eframe::App for Desktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.models.poll();
         self.capabilities.poll();
+        self.picker_catalog.poll();
         if let Some(test) = &mut self.mcp_test {
             test.result.poll();
         }
@@ -1075,6 +1269,7 @@ impl eframe::App for Desktop {
             .frame(Frame::central_panel(&context.style()).inner_margin(Margin::same(24)))
             .show(context, |ui| {
                 if self.settings {
+                    self.picker_catalog = Lookup::Idle;
                     egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui));
                     return;
                 }
@@ -1087,7 +1282,14 @@ impl eframe::App for Desktop {
                         self.persist_chat();
                     }
                 }
-                let message_area = (ui.available_height() - 100.0).max(80.0);
+                let composer_space = if self.picker_query().is_some() {
+                    245.0
+                } else if self.selection.is_some() {
+                    138.0
+                } else {
+                    100.0
+                };
+                let message_area = (ui.available_height() - composer_space).max(40.0);
                 egui::ScrollArea::vertical()
                     .id_salt(&self.active_chat)
                     .stick_to_bottom(true)
@@ -1147,22 +1349,7 @@ impl eframe::App for Desktop {
                             });
                         }
                     });
-                let input = ui.add_enabled(
-                    !self.busy,
-                    TextEdit::multiline(&mut self.prompt)
-                        .hint_text("Message your assistant")
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                );
-                let keyboard = input.has_focus()
-                    && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Send"))
-                    .clicked()
-                    || keyboard
-                {
-                    self.send(context);
-                }
+                self.composer_ui(ui);
             });
         self.approval_ui(context);
     }

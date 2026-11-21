@@ -442,6 +442,12 @@ struct RemoteTool {
     definition: Value,
 }
 
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct McpToolId {
+    pub server: String,
+    pub name: String,
+}
+
 pub struct ToolSet<'a> {
     config: &'a Config,
     servers: Vec<RunningService<RoleClient, ()>>,
@@ -522,7 +528,7 @@ fn terminal_activity(args: &Value) -> String {
 }
 
 impl<'a> ToolSet<'a> {
-    pub async fn connect(config: &'a Config, warning: impl Fn(String)) -> Self {
+    pub async fn connect(config: &'a Config, mut warning: impl FnMut(String)) -> Self {
         let mut set = Self {
             config,
             servers: Vec::new(),
@@ -610,6 +616,25 @@ impl<'a> ToolSet<'a> {
         } else {
             BTreeSet::new()
         }
+    }
+
+    pub fn mcp_tool_choices(&self) -> Vec<McpToolId> {
+        self.remote
+            .values()
+            .map(|tool| McpToolId {
+                server: tool.server_name.clone(),
+                name: tool.name.clone(),
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn mcp_alias(&self, selected: &McpToolId) -> Option<String> {
+        self.remote.iter().find_map(|(alias, tool)| {
+            (tool.server_name == selected.server && tool.name == selected.name)
+                .then(|| alias.clone())
+        })
     }
 
     pub fn definitions(&self, active_mcp_tools: &BTreeSet<String>) -> Vec<Value> {

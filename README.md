@@ -47,6 +47,8 @@ Open a saved conversation from **Recent chats** in the sidebar or select **New c
 
 Pluto registers a path to the skill and reads its instructions when requested. Keep the skill folder available. For a skill from a repository, check it out locally and register that folder. The terminal tool runs an executable with separate arguments in the configured working directory. It is noninteractive and runs with your account's privileges. An explicit shell command can be approved if you need pipes or redirects.
 
+Type `/` at the start of the Chat box to pick a registered skill or an MCP tool. Type to filter, then click a result or use **↑**, **↓**, and **Enter**. Type your request and send it. The selection applies to that message, and tool calls follow the usual approval rules.
+
 For repeat CLI calls, choose **Run always** to save approval for the exact command in that working directory. For commands that use `--` after their fixed arguments, you can also allow the values after `--` to vary while keeping their count fixed. Matching calls show **Auto-approved** in Chat. You can remove a rule under **Settings → Saved approvals**.
 
 ### Update a skill

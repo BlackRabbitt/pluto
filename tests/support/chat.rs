@@ -1,6 +1,6 @@
-use crate::agent::{ApprovalDecision, Event, TokenUsage, chat};
+use crate::agent::{ApprovalDecision, Event, TokenUsage, TurnSelection, chat};
 use crate::providers::{Provider, ThinkingSetting};
-use crate::tools::{ApprovalRule, Config, Mcp, ToolSet};
+use crate::tools::{ApprovalRule, Config, Mcp, McpToolId, ToolSet};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -80,6 +80,7 @@ async fn provider_metadata_controls_chat_reasoning() -> Result<()> {
             config,
             Vec::new(),
             Some(ThinkingSetting::Effort(selected.into())),
+            None,
             |event| {
                 if let Event::Usage {
                     model: reported_model,
@@ -127,7 +128,14 @@ async fn llama_template_can_expose_a_thinking_switch_without_named_levels() -> R
     assert_eq!(levels.len(), 2);
     for (level, enabled) in levels.into_iter().zip([true, false]) {
         assert_eq!(level.setting, ThinkingSetting::Toggle(enabled));
-        let result = chat(config.clone(), Vec::new(), Some(level.setting), |_| {}).await?;
+        let result = chat(
+            config.clone(),
+            Vec::new(),
+            Some(level.setting),
+            None,
+            |_| {},
+        )
+        .await?;
         assert_eq!(
             result,
             if enabled {
@@ -158,9 +166,14 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
         fs::create_dir_all(workspace.join("tests/test-notes"))?;
         fs::copy(example.join("notes.py"), scratch_cli)?;
         let mut config = Config {
+            model_provider: Some(Provider::OpenAiCompatible),
+            model_name: "picked-skill-fixture".into(),
             workspace: workspace.clone(),
             ..Config::default()
         };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
+        let (_http, port) = http_fixture(&fixture).await?;
+        config.model_url = format!("http://127.0.0.1:{port}/v1");
         let name = config.add_skill(&example)?;
         assert_eq!(name, "test-notes");
         let tools = ToolSet::connect(&config, |_| {}).await;
@@ -178,6 +191,24 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
         let note: Value =
             serde_json::from_str(output["stdout"].as_str().context("Missing stdout")?)?;
         assert_eq!(note, json!({"id": 1, "title": "Shopping"}));
+        drop(tools);
+        let approved = std::cell::Cell::new(false);
+        let answer = chat(
+            config,
+            vec![("user".into(), "List my notes".into())],
+            None,
+            Some(TurnSelection::Skill(name)),
+            |event| {
+                if let Event::Approve(request, reply) = event {
+                    assert!(request.description.contains("notes.py"));
+                    approved.set(true);
+                    let _ = reply.send(ApprovalDecision::RunOnce);
+                }
+            },
+        )
+        .await?;
+        assert!(approved.get());
+        assert_eq!(answer, "Picked skill fixture passed");
         Ok(())
     }
     .await;
@@ -212,8 +243,9 @@ async fn find_tools_exposes_fixture_schemas_on_demand() -> Result<()> {
     );
     let approvals = std::cell::Cell::new(0);
     let result = chat(
-        config,
+        config.clone(),
         vec![("user".into(), "Find and use the fixture lookup tool".into())],
+        None,
         None,
         |event| match event {
             Event::Approve(request, reply) => {
@@ -228,6 +260,38 @@ async fn find_tools_exposes_fixture_schemas_on_demand() -> Result<()> {
     .await?;
     assert_eq!(result, "MCP discovery fixture passed");
     assert_eq!(approvals.get(), 1);
+
+    let expected = McpToolId {
+        server: "fixture".into(),
+        name: "lookup".into(),
+    };
+    let tools = ToolSet::connect(&config, |warning| {
+        panic!("Unexpected discovery warning: {warning}")
+    })
+    .await;
+    let selected = tools
+        .mcp_tool_choices()
+        .into_iter()
+        .find(|item| *item == expected)
+        .context("Fixture lookup missing in picker catalog")?;
+    drop(tools);
+    config.model_name = "picked-mcp-fixture".into();
+    let result = chat(
+        config,
+        vec![("user".into(), "Run the selected lookup".into())],
+        None,
+        Some(TurnSelection::Mcp(selected)),
+        |event| {
+            if let Event::Approve(request, reply) = event {
+                assert!(request.description.starts_with("Call fixture / lookup"));
+                approvals.set(approvals.get() + 1);
+                let _ = reply.send(ApprovalDecision::RunOnce);
+            }
+        },
+    )
+    .await?;
+    assert_eq!(result, "Picked MCP fixture passed");
+    assert_eq!(approvals.get(), 2);
     Ok(())
 }
 
@@ -274,6 +338,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
     let result = chat(
         config,
         vec![("user".into(), "Run the fixture".into())],
+        None,
         None,
         |event| match event {
             Event::Status(status) => statuses.borrow_mut().push(status),

@@ -60,6 +60,31 @@ def tool_discovery_model(request):
 
 
 def model(request):
+    if request["model"] == "picked-mcp-fixture":
+        names = [tool["function"]["name"] for tool in request["tools"]]
+        visible = [name for name in names if name.startswith("mcp_")]
+        assert len(visible) == 1 and visible[0].endswith("_fixture_lookup")
+        assert visible[0] in request["messages"][0]["content"]
+        results = [item["content"] for item in request["messages"] if item["role"] == "tool"]
+        if not results:
+            return tool_call(0, visible[0], {})
+        assert len(results) == 1 and "fixture lookup succeeded" in results[0]
+        return {"choices": [{"message": {"content": "Picked MCP fixture passed"}}]}
+    if request["model"] == "picked-skill-fixture":
+        results = [item for item in request["messages"] if item["role"] == "tool"]
+        assert "test-notes" in results[0]["content"]
+        assert "tests/test-notes/notes.py" in results[0]["content"]
+        if len(results) == 1:
+            preload = request["messages"][-2]["tool_calls"][0]
+            assert preload["id"] == results[0]["tool_call_id"]
+            assert preload["function"]["name"] == "load_skill"
+            assert json.loads(preload["function"]["arguments"]) == {"name": "test-notes"}
+            return tool_call(0, "terminal", {"command": "python3", "args": ["tests/test-notes/notes.py", "list"]})
+        assert len(results) == 2
+        output = json.loads(results[-1]["content"])
+        assert output["exit_code"] == 0
+        assert json.loads(output["stdout"]) == [{"id": 1, "title": "Shopping"}]
+        return {"choices": [{"message": {"content": "Picked skill fixture passed"}}]}
     if request["model"] == "find-tools-fixture":
         return tool_discovery_model(request)
     if request["model"] == "toggle fixture":
