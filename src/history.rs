@@ -1,0 +1,196 @@
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::{
+    fs::{self, File},
+    io::{self, BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+pub type Messages = Vec<(String, String)>;
+
+pub struct ChatStore {
+    directory: PathBuf,
+}
+
+pub struct ChatEntry {
+    pub path: PathBuf,
+    pub title: String,
+}
+
+#[derive(Serialize)]
+struct SavedChat<'a> {
+    title: &'a str,
+    messages: &'a [(String, String)],
+}
+
+#[derive(Deserialize)]
+struct ChatTitle {
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct ChatMessages {
+    messages: Messages,
+}
+
+impl ChatStore {
+    pub fn beside(config_path: &Path) -> Self {
+        Self {
+            directory: config_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join("chats"),
+        }
+    }
+
+    pub fn entries(&self) -> Result<(Vec<ChatEntry>, usize)> {
+        let paths = match fs::read_dir(&self.directory) {
+            Ok(paths) => paths,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+            Err(error) => return Err(error).context("Could not open the chat history folder"),
+        };
+        let mut entries = Vec::new();
+        let mut skipped = 0;
+        for entry in paths {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json")
+                || !entry.file_type()?.is_file()
+            {
+                continue;
+            }
+            let title = File::open(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|file| {
+                    Ok(serde_json::from_reader::<_, ChatTitle>(BufReader::new(
+                        file,
+                    ))?)
+                });
+            match title {
+                Ok(ChatTitle { title }) => {
+                    let modified = entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .unwrap_or(UNIX_EPOCH);
+                    entries.push((modified, ChatEntry { path, title }));
+                }
+                Err(_) => skipped += 1,
+            }
+        }
+        entries.sort_unstable_by(|(a_time, a), (b_time, b)| {
+            b_time.cmp(a_time).then_with(|| b.path.cmp(&a.path))
+        });
+        Ok((
+            entries.into_iter().map(|(_, entry)| entry).collect(),
+            skipped,
+        ))
+    }
+
+    pub fn read(&self, path: &Path) -> Result<Messages> {
+        let file = File::open(path).context("Could not open the saved chat")?;
+        let chat: ChatMessages = serde_json::from_reader(BufReader::new(file))
+            .context("Could not read the saved chat")?;
+        ensure!(
+            chat.messages
+                .iter()
+                .all(|(role, _)| matches!(role.as_str(), "user" | "assistant")),
+            "Saved chat contains an invalid message role"
+        );
+        Ok(chat.messages)
+    }
+
+    pub fn save(&self, path: Option<&Path>, messages: &[(String, String)]) -> Result<ChatEntry> {
+        fs::create_dir_all(&self.directory).context("Could not create the chat history folder")?;
+        let path = match path {
+            Some(path) => path.to_owned(),
+            None => self.directory.join(format!("{}.json", unique_id()?)),
+        };
+        let title = messages
+            .iter()
+            .find(|(role, _)| role == "user")
+            .map(|(_, text)| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "Untitled chat".into());
+        let title = match title.char_indices().nth(60) {
+            Some((end, _)) => format!("{}…", &title[..end]),
+            None => title,
+        };
+        let temporary = path.with_extension(format!("{}.tmp", unique_id()?));
+        let mut options = File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&temporary)?;
+        let result = (|| -> Result<()> {
+            let mut file = BufWriter::new(file);
+            serde_json::to_writer_pretty(
+                &mut file,
+                &SavedChat {
+                    title: &title,
+                    messages,
+                },
+            )?;
+            file.flush()?;
+            file.get_ref().sync_all()?;
+            drop(file);
+            fs::rename(&temporary, &path).context("Could not replace the saved chat")
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result?;
+        Ok(ChatEntry { path, title })
+    }
+}
+
+fn unique_id() -> Result<String> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(format!("{timestamp}-{}-{sequence}", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_reopens_and_updates_separate_chats() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("pluto-history-test-{}", std::process::id()));
+        fs::create_dir(&directory)?;
+        let result = check_history(&directory);
+        fs::remove_dir_all(&directory)?;
+        result
+    }
+
+    fn check_history(directory: &Path) -> Result<()> {
+        let config = directory.join("tools.toml");
+        let store = ChatStore::beside(&config);
+        assert!(store.entries()?.0.is_empty());
+
+        let mut first = vec![("user".into(), "First chat\nwith two lines".into())];
+        let first_entry = store.save(None, &first)?;
+        assert_eq!(first_entry.title, "First chat with two lines");
+        let second = vec![("user".into(), "Second chat".into())];
+        let second_entry = store.save(None, &second)?;
+        assert_ne!(first_entry.path, second_entry.path);
+        first.push(("assistant".into(), "Saved reply".into()));
+        let updated = store.save(Some(&first_entry.path), &first)?;
+        assert_eq!(updated.path, first_entry.path);
+        fs::write(store.directory.join("partial.tmp"), "{")?;
+        fs::write(store.directory.join("bad.json"), "{")?;
+
+        let reopened = ChatStore::beside(&config);
+        let (entries, skipped) = reopened.entries()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(skipped, 1);
+        assert_eq!(reopened.read(&first_entry.path)?, first);
+        assert_eq!(reopened.read(&second_entry.path)?, second);
+        Ok(())
+    }
+}
