@@ -7,7 +7,7 @@ mod tools;
 #[path = "../tests/support/chat.rs"]
 mod chat_test;
 
-use agent::{Event, TokenUsage};
+use agent::{ApprovalDecision, Event, TokenUsage};
 use anyhow::Result;
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
-use tools::{Config, Mcp, valid_name};
+use tools::{ApprovalRequest, Config, Mcp, TerminalApproval, valid_name};
 
 const APP_NAME: &str = "Pluto";
 
@@ -139,6 +139,13 @@ impl<T: Send + 'static> Lookup<T> {
     }
 }
 
+struct PendingApproval {
+    request: ApprovalRequest,
+    reply: oneshot::Sender<ApprovalDecision>,
+    allow_other_operands: bool,
+    error: Option<String>,
+}
+
 struct Desktop {
     runtime: tokio::runtime::Runtime,
     events: mpsc::Receiver<Event>,
@@ -165,7 +172,7 @@ struct Desktop {
     notice: String,
     connection_errors: Vec<String>,
     config_error: bool,
-    approval: Option<(String, oneshot::Sender<bool>)>,
+    approval: Option<PendingApproval>,
     workspace: String,
     skill_path: String,
     mcp_name: String,
@@ -262,7 +269,7 @@ impl Desktop {
             self.notice = "Choose a provider, enter its server URL, and select a model.".into();
             return;
         }
-        self.status = "Discovering tools".into();
+        self.status = "Discovering tools…".into();
         self.connection_errors.clear();
         self.busy = true;
         self.history
@@ -380,6 +387,122 @@ impl Desktop {
             Ok(()) => "Settings saved".into(),
             Err(error) => format!("Could not save: {error:#}"),
         };
+    }
+
+    fn update_terminal_approvals(
+        &mut self,
+        edit: impl FnOnce(&mut Vec<TerminalApproval>),
+    ) -> Result<()> {
+        let mut saved = Config::load()?;
+        edit(&mut saved.terminal_approvals);
+        saved.save()?;
+        self.config.terminal_approvals = saved.terminal_approvals;
+        Ok(())
+    }
+
+    fn terminal_approvals_ui(&mut self, ui: &mut egui::Ui) {
+        if self.config.terminal_approvals.is_empty() {
+            return;
+        }
+        let mut forget = None;
+        egui::CollapsingHeader::new("Saved CLI approvals").show(ui, |ui| {
+            for rule in &self.config.terminal_approvals {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Forget").clicked() {
+                        forget = Some(rule.clone());
+                    }
+                    ui.add(egui::Label::new(RichText::new(rule.label()).monospace()).wrap());
+                });
+            }
+        });
+        if let Some(rule) = forget {
+            self.notice = match self
+                .update_terminal_approvals(|rules| rules.retain(|saved| *saved != rule))
+            {
+                Ok(()) => "CLI approval removed".into(),
+                Err(error) => format!("Could not remove approval: {error:#}"),
+            };
+        }
+    }
+
+    fn approval_ui(&mut self, context: &egui::Context) {
+        let Some(pending) = &mut self.approval else {
+            return;
+        };
+        let mut decision = None;
+        let mut remember = None;
+        egui::Modal::new(egui::Id::new("approval")).show(context, |ui| {
+            ui.set_width(500.0);
+            ui.heading("Approve tool call");
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&pending.request.description).monospace())
+                            .wrap()
+                            .selectable(true),
+                    );
+                });
+            let scope = pending.request.terminal.as_ref().map(|exact| {
+                let similar = exact.allow_other_operands();
+                if similar.is_some() {
+                    ui.checkbox(
+                        &mut pending.allow_other_operands,
+                        "Allow different values after --",
+                    );
+                }
+                match similar.filter(|_| pending.allow_other_operands) {
+                    Some(rule) => {
+                        ui.label(RichText::new(rule.label()).monospace().small());
+                        rule
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new(
+                                "Run always saves this exact command and working directory.",
+                            )
+                            .small(),
+                        );
+                        exact.clone()
+                    }
+                }
+            });
+            if let Some(error) = &pending.error {
+                ui.label(RichText::new(error).color(ui.visuals().warn_fg_color));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Decline").clicked() {
+                    decision = Some(ApprovalDecision::Decline);
+                }
+                if ui.button("Run once").clicked() {
+                    decision = Some(ApprovalDecision::RunOnce);
+                }
+                if let Some(rule) = scope
+                    && ui.button("Run always").clicked()
+                {
+                    remember = Some(rule);
+                }
+            });
+        });
+        if let Some(rule) = remember {
+            match self.update_terminal_approvals(|rules| {
+                if !rules.contains(&rule) {
+                    rules.push(rule);
+                }
+            }) {
+                Ok(()) => decision = Some(ApprovalDecision::RunOnce),
+                Err(error) => {
+                    if let Some(pending) = &mut self.approval {
+                        pending.error = Some(format!("Could not save approval: {error:#}"));
+                    }
+                }
+            }
+        }
+        if let Some(decision) = decision
+            && let Some(pending) = self.approval.take()
+        {
+            let _ = pending.reply.send(decision);
+        }
     }
 
     fn sync_discovery(&mut self) {
@@ -646,6 +769,7 @@ impl Desktop {
             &mut self.workspace,
             "/path/to/workspace",
         );
+        self.terminal_approvals_ui(ui);
         ui.separator();
         ui.heading("Skills");
         let mut remove = None;
@@ -762,7 +886,23 @@ impl eframe::App for Desktop {
             match event {
                 Event::Status(status) => self.status = status,
                 Event::Warning(warning) => self.connection_errors.push(warning),
-                Event::Approve(description, reply) => self.approval = Some((description, reply)),
+                Event::Approve(request, reply) => {
+                    if request.terminal.as_ref().is_some_and(|terminal| {
+                        self.config
+                            .terminal_approvals
+                            .iter()
+                            .any(|rule| rule.matches(terminal))
+                    }) {
+                        let _ = reply.send(ApprovalDecision::AutoApproved);
+                    } else {
+                        self.approval = Some(PendingApproval {
+                            request,
+                            reply,
+                            allow_other_operands: false,
+                            error: None,
+                        });
+                    }
+                }
                 Event::Usage {
                     connection,
                     model,
@@ -841,9 +981,6 @@ impl eframe::App for Desktop {
                         self.persist_chat();
                     }
                 }
-                if !self.status.is_empty() {
-                    ui.label(RichText::new(&self.status).weak());
-                }
                 let message_area = (ui.available_height() - 100.0).max(80.0);
                 egui::ScrollArea::vertical()
                     .id_salt(&self.active_chat)
@@ -887,6 +1024,22 @@ impl eframe::App for Desktop {
                                     }
                                 });
                         }
+                        if !self.status.is_empty() {
+                            ui.horizontal(|ui| {
+                                if self.busy && self.approval.is_none() {
+                                    ui.spinner();
+                                }
+                                let text = RichText::new(&self.status).small();
+                                ui.add(
+                                    egui::Label::new(if self.busy {
+                                        text.weak()
+                                    } else {
+                                        text.color(ui.visuals().warn_fg_color)
+                                    })
+                                    .wrap(),
+                                );
+                            });
+                        }
                     });
                 let input = ui.add_enabled(
                     !self.busy,
@@ -905,34 +1058,6 @@ impl eframe::App for Desktop {
                     self.send(context);
                 }
             });
-        if let Some((description, _)) = &self.approval {
-            let mut choice = None;
-            egui::Modal::new(egui::Id::new("approval")).show(context, |ui| {
-                ui.set_width(500.0);
-                ui.heading("Approve tool call");
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(description).monospace())
-                                .wrap()
-                                .selectable(true),
-                        );
-                    });
-                ui.horizontal(|ui| {
-                    if ui.button("Decline").clicked() {
-                        choice = Some(false);
-                    }
-                    if ui.button("Run once").clicked() {
-                        choice = Some(true);
-                    }
-                });
-            });
-            if let Some(choice) = choice {
-                if let Some((_, reply)) = self.approval.take() {
-                    let _ = reply.send(choice);
-                }
-            }
-        }
+        self.approval_ui(context);
     }
 }

@@ -1,6 +1,6 @@
 use crate::APP_NAME;
 use crate::providers::{Connection, ThinkingSetting};
-use crate::tools::{Config, ToolSet};
+use crate::tools::{ApprovalRequest, Config, ToolSet};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -9,13 +9,21 @@ use tokio::sync::oneshot;
 pub enum Event {
     Status(String),
     Warning(String),
-    Approve(String, oneshot::Sender<bool>),
+    Approve(ApprovalRequest, oneshot::Sender<ApprovalDecision>),
     Usage {
         connection: Connection,
         model: String,
         tokens: Option<TokenUsage>,
     },
     Finished(Result<String>),
+}
+
+#[derive(Default)]
+pub enum ApprovalDecision {
+    #[default]
+    Decline,
+    RunOnce,
+    AutoApproved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,12 +77,16 @@ pub async fn chat(
             .map(|(role, content)| json!({"role": role, "content": content})),
     );
 
+    let mut auto_approved = None;
     for step in 0..12 {
-        emit(Event::Status(if step == 0 {
-            "Waiting for the model".into()
-        } else {
-            "Continuing with tool results".into()
-        }));
+        let status = match auto_approved.take() {
+            Some(activity) => {
+                format!("{APP_NAME} is reviewing the tool results… · Auto-approved · {activity}")
+            }
+            None if step == 0 => format!("{APP_NAME} is preparing a reply…"),
+            None => format!("{APP_NAME} is reviewing the tool results…"),
+        };
+        emit(Event::Status(status));
         let response = connection
             .chat_request(&client, model, &messages, &definitions, thinking.as_ref())?
             .send()
@@ -115,15 +127,25 @@ pub async fn chat(
             let raw = call["function"]["arguments"].as_str().unwrap_or("{}");
             let result = match serde_json::from_str::<Value>(raw) {
                 Ok(args) if args.is_object() => {
-                    if let Some(description) = tools.approval(name, &args) {
+                    let activity = tools.activity(name, &args);
+                    let mut running = format!("Running · {activity}");
+                    if let Some(request) = tools.approval(name, &args) {
                         let (tx, rx) = oneshot::channel();
-                        emit(Event::Approve(description, tx));
-                        if !rx.await.unwrap_or(false) {
-                            messages.push(json!({"role":"tool","tool_call_id":id,"content":"The user declined this action. Do not retry it."}));
-                            continue;
+                        emit(Event::Status(format!("Waiting for approval · {activity}")));
+                        emit(Event::Approve(request, tx));
+                        match rx.await.unwrap_or_default() {
+                            ApprovalDecision::Decline => {
+                                messages.push(json!({"role":"tool","tool_call_id":id,"content":"The user declined this action. Do not retry it."}));
+                                continue;
+                            }
+                            ApprovalDecision::RunOnce => {}
+                            ApprovalDecision::AutoApproved => {
+                                running = format!("Running · Auto-approved · {activity}");
+                                auto_approved = Some(activity);
+                            }
                         }
                     }
-                    emit(Event::Status(format!("Running {name}")));
+                    emit(Event::Status(running));
                     tools.call(name, args).await
                 }
                 _ => Err(anyhow::anyhow!("Tool arguments must be a JSON object")),

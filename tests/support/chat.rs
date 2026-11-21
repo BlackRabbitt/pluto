@@ -1,4 +1,4 @@
-use crate::agent::{Event, TokenUsage, chat};
+use crate::agent::{ApprovalDecision, Event, TokenUsage, chat};
 use crate::providers::{Provider, ThinkingSetting};
 use crate::tools::{Config, Mcp, ToolSet};
 use anyhow::{Context, Result};
@@ -171,6 +171,7 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
             "command": "python3",
             "args": [relative_cli, "add", "--", "Shopping", "Buy milk"]
         });
+        assert_eq!(tools.activity("terminal", &args), "python3 notes.py add");
         assert!(tools.approval("terminal", &args).is_some());
         let output: Value = serde_json::from_str(&tools.call("terminal", args).await?)?;
         assert_eq!(output["exit_code"], 0, "{output}");
@@ -219,14 +220,23 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
     );
 
     let approvals = std::cell::RefCell::new(Vec::new());
+    let statuses = std::cell::RefCell::new(Vec::new());
     let result = chat(
         config,
         vec![("user".into(), "Run the fixture".into())],
         None,
         |event| match event {
-            Event::Approve(details, reply) => {
-                let _ = reply.send(!details.contains("should be declined"));
-                approvals.borrow_mut().push(details);
+            Event::Status(status) => statuses.borrow_mut().push(status),
+            Event::Approve(request, reply) => {
+                let decision = if request.description.contains("should be declined") {
+                    ApprovalDecision::Decline
+                } else if request.terminal.is_some() {
+                    ApprovalDecision::AutoApproved
+                } else {
+                    ApprovalDecision::RunOnce
+                };
+                let _ = reply.send(decision);
+                approvals.borrow_mut().push(request.description);
             }
             Event::Warning(warning) => panic!("Unexpected discovery warning: {warning}"),
             _ => {}
@@ -236,5 +246,16 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
     fs::remove_dir_all(&directory)?;
     assert_eq!(result?, "Pluto fixture passed");
     assert_eq!(approvals.into_inner().len(), 4);
+    let statuses = statuses.into_inner();
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status == "Running · Auto-approved · printf")
+    );
+    assert!(statuses.windows(2).any(|steps| steps
+        == [
+            "Waiting for approval · local / lookup · Look up the fixture",
+            "Running · local / lookup · Look up the fixture",
+        ]));
     Ok(())
 }

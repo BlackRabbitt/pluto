@@ -33,6 +33,8 @@ pub struct Config {
     pub model_name: String,
     pub model_token_env: String,
     pub workspace: PathBuf,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub terminal_approvals: Vec<TerminalApproval>,
     pub skills: BTreeMap<String, Skill>,
     pub mcp: BTreeMap<String, Mcp>,
 }
@@ -41,6 +43,76 @@ pub struct Config {
 pub struct Skill {
     pub path: PathBuf,
     pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalApproval {
+    workspace: PathBuf,
+    command: String,
+    args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operand_count: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct TerminalInvocation {
+    command: String,
+    args: Vec<String>,
+}
+
+pub struct ApprovalRequest {
+    pub description: String,
+    pub terminal: Option<TerminalApproval>,
+}
+
+impl TerminalApproval {
+    fn for_invocation(workspace: &Path, invocation: TerminalInvocation) -> Option<Self> {
+        Some(Self {
+            workspace: workspace.canonicalize().ok()?,
+            command: invocation.command,
+            args: invocation.args,
+            operand_count: None,
+        })
+    }
+
+    pub fn allow_other_operands(&self) -> Option<Self> {
+        let separator = self.args.iter().position(|arg| arg == "--")?;
+        let prefix_len = separator + 1;
+        let operand_count = self.args.len() - prefix_len;
+        if separator == 0 || operand_count == 0 {
+            return None;
+        }
+        Some(Self {
+            args: self.args[..prefix_len].to_vec(),
+            operand_count: Some(operand_count),
+            ..self.clone()
+        })
+    }
+
+    pub fn matches(&self, request: &Self) -> bool {
+        request.operand_count.is_none()
+            && self.workspace == request.workspace
+            && self.command == request.command
+            && match self.operand_count {
+                Some(count) => {
+                    self.args.len() > 1
+                        && self.args.last().is_some_and(|arg| arg == "--")
+                        && count > 0
+                        && request.args.starts_with(&self.args)
+                        && request.args.len() - self.args.len() == count
+                }
+                None => self.args == request.args,
+            }
+    }
+
+    pub fn label(&self) -> String {
+        let args = serde_json::to_string(&self.args).unwrap_or_default();
+        let scope = match self.operand_count {
+            Some(count) => format!("{args} followed by {count} argument(s)"),
+            None => args,
+        };
+        format!("{} {scope}\n{}", self.command, self.workspace.display())
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -66,6 +138,7 @@ impl Default for Config {
             model_name: String::new(),
             model_token_env: String::new(),
             workspace: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            terminal_approvals: Vec::new(),
             skills: BTreeMap::new(),
             mcp: BTreeMap::new(),
         }
@@ -261,6 +334,7 @@ struct RemoteTool {
     server: usize,
     name: String,
     target: String,
+    activity: String,
     definition: Value,
 }
 
@@ -274,6 +348,65 @@ fn function(name: &str, description: &str, parameters: Value) -> Value {
     json!({"type":"function","function":{
         "name":name,"description":description,"parameters":parameters
     }})
+}
+
+fn activity_text(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    match line.char_indices().nth(100) {
+        Some((end, _)) => format!("{}…", &line[..end]),
+        None => line.to_owned(),
+    }
+}
+
+fn terminal_activity(args: &Value) -> String {
+    let command = args["command"]
+        .as_str()
+        .and_then(|path| Path::new(path).file_name()?.to_str())
+        .unwrap_or("Terminal command");
+    let mut arguments = args["args"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(Value::as_str);
+    let first = arguments.next().flatten();
+    let script = match command.split('.').next() {
+        Some("python" | "python3" | "node" | "ruby" | "perl") => first
+            .filter(|arg| !arg.starts_with('-'))
+            .and_then(|arg| Path::new(arg).file_name()?.to_str()),
+        _ => None,
+    };
+    // Show familiar subcommands without copying arbitrary argument values.
+    let operation = if script.is_some() {
+        arguments.next().flatten()
+    } else {
+        first
+    }
+    .filter(|arg| {
+        matches!(
+            *arg,
+            "add"
+                | "check"
+                | "create"
+                | "edit"
+                | "fetch"
+                | "get"
+                | "list"
+                | "log"
+                | "lookup"
+                | "read"
+                | "search"
+                | "show"
+                | "status"
+                | "update"
+        )
+    });
+    activity_text(
+        &[Some(command), script, operation]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 impl<'a> ToolSet<'a> {
@@ -311,6 +444,21 @@ impl<'a> ToolSet<'a> {
                     set.servers.push(client);
                     for tool in tools {
                         let target = format!("{name} / {}", tool.name);
+                        let purpose = [
+                            tool.title.as_deref(),
+                            tool.annotations
+                                .as_ref()
+                                .and_then(|hint| hint.title.as_deref()),
+                            tool.description.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .map(activity_text)
+                        .find(|text| !text.is_empty());
+                        let activity = match purpose {
+                            Some(purpose) => format!("{} · {purpose}", activity_text(&target)),
+                            None => activity_text(&target),
+                        };
                         let slug = format!("{name}_{}", tool.name)
                             .chars()
                             .map(|c| {
@@ -334,6 +482,7 @@ impl<'a> ToolSet<'a> {
                                 server,
                                 name: tool.name.into_owned(),
                                 target,
+                                activity,
                                 definition,
                             },
                         );
@@ -368,32 +517,50 @@ impl<'a> ToolSet<'a> {
         tools
     }
 
-    pub fn approval(&self, name: &str, args: &Value) -> Option<String> {
+    pub fn approval(&self, name: &str, args: &Value) -> Option<ApprovalRequest> {
         if name == "terminal" {
-            return Some(format!(
-                "Run a terminal command in {}\n\n{}",
-                self.config.workspace.display(),
-                serde_json::to_string_pretty(args).unwrap_or_default()
-            ));
+            let terminal = serde_json::from_value(args.clone())
+                .ok()
+                .and_then(|invocation| {
+                    TerminalApproval::for_invocation(&self.config.workspace, invocation)
+                });
+            return Some(ApprovalRequest {
+                description: format!(
+                    "Run a terminal command in {}\n\n{}",
+                    self.config.workspace.display(),
+                    serde_json::to_string_pretty(args).unwrap_or_default()
+                ),
+                terminal,
+            });
         }
-        self.remote.get(name).map(|tool| {
-            format!(
+        self.remote.get(name).map(|tool| ApprovalRequest {
+            description: format!(
                 "Call {}\n\n{}",
                 tool.target,
                 serde_json::to_string_pretty(args).unwrap_or_default()
-            )
+            ),
+            terminal: None,
         })
+    }
+
+    pub fn activity(&self, name: &str, args: &Value) -> String {
+        match name {
+            "terminal" => terminal_activity(args),
+            "load_skill" => match args["name"].as_str().filter(|name| valid_name(name)) {
+                Some(name) => format!("Load skill {name}"),
+                None => "Load skill".into(),
+            },
+            _ => self
+                .remote
+                .get(name)
+                .map_or_else(|| activity_text(name), |tool| tool.activity.clone()),
+        }
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<String> {
         match name {
             "terminal" => {
-                #[derive(Deserialize)]
-                struct Invocation {
-                    command: String,
-                    args: Vec<String>,
-                }
-                let invocation: Invocation = serde_json::from_value(args)?;
+                let invocation: TerminalInvocation = serde_json::from_value(args)?;
                 run_process(
                     &self.config.workspace,
                     &invocation.command,
@@ -472,6 +639,47 @@ async fn run_process(workspace: &Path, executable: &str, args: &[String]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembered_cli_approvals_match_only_the_saved_scope() -> Result<()> {
+        let first = TerminalApproval {
+            workspace: "/workspace".into(),
+            command: "python3".into(),
+            args: ["notes.py", "search", "--", "milk"]
+                .map(str::to_owned)
+                .to_vec(),
+            operand_count: None,
+        };
+        let mut next = first.clone();
+        next.args[3] = "coffee".into();
+        let similar = first
+            .allow_other_operands()
+            .context("Missing operand scope")?;
+        let config = Config {
+            terminal_approvals: vec![first.clone(), similar],
+            ..Config::default()
+        };
+        let reopened: Config = toml::from_str(&toml::to_string(&config)?)?;
+        let [exact, similar] = reopened.terminal_approvals.as_slice() else {
+            bail!("Expected both approval rules");
+        };
+        assert!(exact.matches(&first));
+        assert!(!exact.matches(&next));
+        assert!(similar.matches(&next));
+
+        next.args.insert(2, "--extra-option".into());
+        assert!(!similar.matches(&next));
+        next.args.remove(2);
+        next.args.push("another operand".into());
+        assert!(!similar.matches(&next));
+        next.args.pop();
+        next.workspace = "/other-workspace".into();
+        assert!(!similar.matches(&next));
+        next.workspace = first.workspace.clone();
+        next.command = "other-executable".into();
+        assert!(!similar.matches(&next));
+        Ok(())
+    }
 
     #[test]
     fn migrates_settings_and_history_without_overwriting_pluto_data() -> Result<()> {
