@@ -60,12 +60,15 @@ def model(request):
         name, arguments = next(n for n in names if n.endswith("_local_lookup")), {}
     elif len(messages) == 3:
         assert "fixture lookup succeeded" in messages[-1]["content"]
-        name, arguments = next(n for n in names if n.endswith("_remote_lookup")), {}
+        name, arguments = next(n for n in names if n.endswith("_local_lookup")), {"query": "another lookup"}
     elif len(messages) == 4:
+        assert "fixture lookup succeeded" in messages[-1]["content"]
+        name, arguments = next(n for n in names if n.endswith("_remote_lookup")), {}
+    elif len(messages) == 5:
         assert "fixture lookup succeeded" in messages[-1]["content"]
         name, arguments = "terminal", {"command": "printf", "args": ["should be declined"]}
     else:
-        assert len(messages) == 5 and "declined" in messages[-1]["content"]
+        assert len(messages) == 6 and "declined" in messages[-1]["content"]
         return {"choices": [{"message": {"role": "assistant", "content": "Pluto fixture passed"}}]}
     return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
         "id": f"call_{len(messages)}", "type": "function",

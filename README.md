@@ -47,7 +47,7 @@ Open a saved conversation from **Recent chats** in the sidebar or select **New c
 
 Pluto registers a path to the skill and reads its instructions when requested. Keep the skill folder available. For a skill from a repository, check it out locally and register that folder. The terminal tool runs an executable with separate arguments in the configured working directory. It is noninteractive and runs with your account's privileges. An explicit shell command can be approved if you need pipes or redirects.
 
-For repeat CLI calls, choose **Run always** to save approval for the exact command in that working directory. For commands that use `--` after their fixed arguments, you can also allow the values after `--` to vary while keeping their count fixed. Matching calls show **Auto-approved** in Chat. You can remove a rule under **Settings → Saved CLI approvals**.
+For repeat CLI calls, choose **Run always** to save approval for the exact command in that working directory. For commands that use `--` after their fixed arguments, you can also allow the values after `--` to vary while keeping their count fixed. Matching calls show **Auto-approved** in Chat. You can remove a rule under **Settings → Saved approvals**.
 
 ### Update a skill
 
@@ -79,6 +79,8 @@ In **Settings → MCP servers**, select a transport and enter the server details
 - **Remote HTTP** uses Streamable HTTP. Enter the MCP endpoint URL and, when required, the name of an environment variable holding its bearer token. Set the variable before launching the app.
 
 Select **Add MCP server** and save. Chat discovers each server's tools and shows any connection errors. The app asks for approval before calling a tool. Install or authorize the server using its own instructions.
+
+Choose **Run always** to approve future calls to that specific tool on the same server configuration, including calls with different arguments. Matching calls show **Auto-approved** in Chat. Use **Settings → Saved approvals** to forget an approval.
 
 For Slack, register a configured Slack MCP server using either transport. Slack's [official hosted endpoint](https://docs.slack.dev/ai/slack-mcp-server/) requires a registered Slack app and OAuth. This build accepts a caller-supplied bearer token for compatible HTTP servers. It does not run the Slack authorization flow or refresh credentials. A Slack MCP server that handles its own credentials can be registered as a local process.
 

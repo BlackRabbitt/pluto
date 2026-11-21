@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
-use tools::{ApprovalRequest, Config, Mcp, TerminalApproval, valid_name};
+use tools::{ApprovalRequest, ApprovalRule, Config, Mcp, valid_name};
 
 const APP_NAME: &str = "Pluto";
 
@@ -389,24 +389,34 @@ impl Desktop {
         };
     }
 
-    fn update_terminal_approvals(
-        &mut self,
-        edit: impl FnOnce(&mut Vec<TerminalApproval>),
-    ) -> Result<()> {
+    fn update_approvals(&mut self, edit: impl FnOnce(&mut Config)) -> Result<()> {
         let mut saved = Config::load()?;
-        edit(&mut saved.terminal_approvals);
+        edit(&mut saved);
         saved.save()?;
         self.config.terminal_approvals = saved.terminal_approvals;
+        self.config.mcp_approvals = saved.mcp_approvals;
         Ok(())
     }
 
-    fn terminal_approvals_ui(&mut self, ui: &mut egui::Ui) {
-        if self.config.terminal_approvals.is_empty() {
+    fn saved_approvals_ui(&mut self, ui: &mut egui::Ui) {
+        if self.config.terminal_approvals.is_empty() && self.config.mcp_approvals.is_empty() {
             return;
         }
         let mut forget = None;
-        egui::CollapsingHeader::new("Saved CLI approvals").show(ui, |ui| {
-            for rule in &self.config.terminal_approvals {
+        egui::CollapsingHeader::new("Saved approvals").show(ui, |ui| {
+            let cli = self
+                .config
+                .terminal_approvals
+                .iter()
+                .cloned()
+                .map(ApprovalRule::Terminal);
+            let mcp = self
+                .config
+                .mcp_approvals
+                .iter()
+                .cloned()
+                .map(ApprovalRule::Mcp);
+            for rule in cli.chain(mcp) {
                 ui.horizontal(|ui| {
                     if ui.small_button("Forget").clicked() {
                         forget = Some(rule.clone());
@@ -416,10 +426,8 @@ impl Desktop {
             }
         });
         if let Some(rule) = forget {
-            self.notice = match self
-                .update_terminal_approvals(|rules| rules.retain(|saved| *saved != rule))
-            {
-                Ok(()) => "CLI approval removed".into(),
+            self.notice = match self.update_approvals(|saved| saved.forget_approval(&rule)) {
+                Ok(()) => "Approval removed".into(),
                 Err(error) => format!("Could not remove approval: {error:#}"),
             };
         }
@@ -443,7 +451,13 @@ impl Desktop {
                             .selectable(true),
                     );
                 });
-            let scope = pending.request.terminal.as_ref().map(|exact| {
+            let scope = pending.request.rule.as_ref().map(|rule| {
+                let ApprovalRule::Terminal(exact) = rule else {
+                    ui.label(RichText::new(
+                        "Run always approves this tool on this server, including calls with different arguments."
+                    ).small());
+                    return rule.clone();
+                };
                 let similar = exact.allow_other_operands();
                 if similar.is_some() {
                     ui.checkbox(
@@ -451,7 +465,7 @@ impl Desktop {
                         "Allow different values after --",
                     );
                 }
-                match similar.filter(|_| pending.allow_other_operands) {
+                let selected = match similar.filter(|_| pending.allow_other_operands) {
                     Some(rule) => {
                         ui.label(RichText::new(rule.label()).monospace().small());
                         rule
@@ -465,7 +479,8 @@ impl Desktop {
                         );
                         exact.clone()
                     }
-                }
+                };
+                ApprovalRule::Terminal(selected)
             });
             if let Some(error) = &pending.error {
                 ui.label(RichText::new(error).color(ui.visuals().warn_fg_color));
@@ -485,11 +500,7 @@ impl Desktop {
             });
         });
         if let Some(rule) = remember {
-            match self.update_terminal_approvals(|rules| {
-                if !rules.contains(&rule) {
-                    rules.push(rule);
-                }
-            }) {
+            match self.update_approvals(|saved| saved.remember_approval(rule)) {
                 Ok(()) => decision = Some(ApprovalDecision::RunOnce),
                 Err(error) => {
                     if let Some(pending) = &mut self.approval {
@@ -769,7 +780,7 @@ impl Desktop {
             &mut self.workspace,
             "/path/to/workspace",
         );
-        self.terminal_approvals_ui(ui);
+        self.saved_approvals_ui(ui);
         ui.separator();
         ui.heading("Skills");
         let mut remove = None;
@@ -887,12 +898,11 @@ impl eframe::App for Desktop {
                 Event::Status(status) => self.status = status,
                 Event::Warning(warning) => self.connection_errors.push(warning),
                 Event::Approve(request, reply) => {
-                    if request.terminal.as_ref().is_some_and(|terminal| {
-                        self.config
-                            .terminal_approvals
-                            .iter()
-                            .any(|rule| rule.matches(terminal))
-                    }) {
+                    if request
+                        .rule
+                        .as_ref()
+                        .is_some_and(|rule| self.config.permits(rule))
+                    {
                         let _ = reply.send(ApprovalDecision::AutoApproved);
                     } else {
                         self.approval = Some(PendingApproval {

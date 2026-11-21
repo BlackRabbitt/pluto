@@ -1,6 +1,6 @@
 use crate::agent::{ApprovalDecision, Event, TokenUsage, chat};
 use crate::providers::{Provider, ThinkingSetting};
-use crate::tools::{Config, Mcp, ToolSet};
+use crate::tools::{ApprovalRule, Config, Mcp, ToolSet};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -221,6 +221,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
 
     let approvals = std::cell::RefCell::new(Vec::new());
     let statuses = std::cell::RefCell::new(Vec::new());
+    let remembered = std::cell::RefCell::new(config.clone());
     let result = chat(
         config,
         vec![("user".into(), "Run the fixture".into())],
@@ -230,9 +231,19 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
             Event::Approve(request, reply) => {
                 let decision = if request.description.contains("should be declined") {
                     ApprovalDecision::Decline
-                } else if request.terminal.is_some() {
+                } else if matches!(request.rule, Some(ApprovalRule::Terminal(_)))
+                    || request
+                        .rule
+                        .as_ref()
+                        .is_some_and(|rule| remembered.borrow().permits(rule))
+                {
                     ApprovalDecision::AutoApproved
                 } else {
+                    if request.description.starts_with("Call local / lookup")
+                        && let Some(rule @ ApprovalRule::Mcp(_)) = request.rule
+                    {
+                        remembered.borrow_mut().remember_approval(rule);
+                    }
                     ApprovalDecision::RunOnce
                 };
                 let _ = reply.send(decision);
@@ -245,7 +256,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
     .await;
     fs::remove_dir_all(&directory)?;
     assert_eq!(result?, "Pluto fixture passed");
-    assert_eq!(approvals.into_inner().len(), 4);
+    assert_eq!(approvals.into_inner().len(), 5);
     let statuses = statuses.into_inner();
     assert!(
         statuses
@@ -257,5 +268,15 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
             "Waiting for approval · local / lookup · Look up the fixture",
             "Running · local / lookup · Look up the fixture",
         ]));
+    assert!(
+        statuses.iter().any(
+            |status| status == "Running · Auto-approved · local / lookup · Look up the fixture"
+        )
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status == "Running · remote / lookup · Look up the fixture")
+    );
     Ok(())
 }

@@ -35,6 +35,8 @@ pub struct Config {
     pub workspace: PathBuf,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub terminal_approvals: Vec<TerminalApproval>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mcp_approvals: Vec<McpApproval>,
     pub skills: BTreeMap<String, Skill>,
     pub mcp: BTreeMap<String, Mcp>,
 }
@@ -62,7 +64,29 @@ struct TerminalInvocation {
 
 pub struct ApprovalRequest {
     pub description: String,
-    pub terminal: Option<TerminalApproval>,
+    pub rule: Option<ApprovalRule>,
+}
+
+#[derive(Clone)]
+pub enum ApprovalRule {
+    Terminal(TerminalApproval),
+    Mcp(McpApproval),
+}
+
+impl ApprovalRule {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Terminal(rule) => rule.label(),
+            Self::Mcp(rule) => format!("MCP · {} / {}", rule.server, rule.tool),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpApproval {
+    server: String,
+    tool: String,
+    connection: Mcp,
 }
 
 impl TerminalApproval {
@@ -115,7 +139,7 @@ impl TerminalApproval {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum Mcp {
     Stdio {
@@ -139,6 +163,7 @@ impl Default for Config {
             model_token_env: String::new(),
             workspace: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             terminal_approvals: Vec::new(),
+            mcp_approvals: Vec::new(),
             skills: BTreeMap::new(),
             mcp: BTreeMap::new(),
         }
@@ -152,6 +177,41 @@ struct SkillHeader {
 }
 
 impl Config {
+    pub fn permits(&self, rule: &ApprovalRule) -> bool {
+        match rule {
+            ApprovalRule::Terminal(request) => self
+                .terminal_approvals
+                .iter()
+                .any(|saved| saved.matches(request)),
+            ApprovalRule::Mcp(request) => {
+                self.mcp.get(&request.server) == Some(&request.connection)
+                    && self.mcp_approvals.contains(request)
+            }
+        }
+    }
+
+    pub fn remember_approval(&mut self, rule: ApprovalRule) {
+        match rule {
+            ApprovalRule::Terminal(rule) => {
+                if !self.terminal_approvals.contains(&rule) {
+                    self.terminal_approvals.push(rule);
+                }
+            }
+            ApprovalRule::Mcp(rule) => {
+                if !self.mcp_approvals.contains(&rule) {
+                    self.mcp_approvals.push(rule);
+                }
+            }
+        }
+    }
+
+    pub fn forget_approval(&mut self, rule: &ApprovalRule) {
+        match rule {
+            ApprovalRule::Terminal(rule) => self.terminal_approvals.retain(|saved| saved != rule),
+            ApprovalRule::Mcp(rule) => self.mcp_approvals.retain(|saved| saved != rule),
+        }
+    }
+
     pub fn model_connection(&self) -> Result<Connection> {
         Connection::new(
             self.model_provider.context("Choose a model provider")?,
@@ -332,6 +392,7 @@ impl Mcp {
 
 struct RemoteTool {
     server: usize,
+    server_name: String,
     name: String,
     target: String,
     activity: String,
@@ -480,6 +541,7 @@ impl<'a> ToolSet<'a> {
                             alias,
                             RemoteTool {
                                 server,
+                                server_name: name.clone(),
                                 name: tool.name.into_owned(),
                                 target,
                                 activity,
@@ -530,7 +592,7 @@ impl<'a> ToolSet<'a> {
                     self.config.workspace.display(),
                     serde_json::to_string_pretty(args).unwrap_or_default()
                 ),
-                terminal,
+                rule: terminal.map(ApprovalRule::Terminal),
             });
         }
         self.remote.get(name).map(|tool| ApprovalRequest {
@@ -539,7 +601,13 @@ impl<'a> ToolSet<'a> {
                 tool.target,
                 serde_json::to_string_pretty(args).unwrap_or_default()
             ),
-            terminal: None,
+            rule: self.config.mcp.get(&tool.server_name).map(|connection| {
+                ApprovalRule::Mcp(McpApproval {
+                    server: tool.server_name.clone(),
+                    tool: tool.name.clone(),
+                    connection: connection.clone(),
+                })
+            }),
         })
     }
 
@@ -639,6 +707,46 @@ async fn run_process(workspace: &Path, executable: &str, args: &[String]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_mcp_approval_is_specific_to_the_tool_and_server() -> Result<()> {
+        let server = Mcp::Http {
+            url: "http://127.0.0.1:8080/mcp".into(),
+            token_env: String::new(),
+        };
+        let approval = McpApproval {
+            server: "first".into(),
+            tool: "lookup".into(),
+            connection: server.clone(),
+        };
+        let mut config = Config::default();
+        config.mcp.insert("first".into(), server.clone());
+        config.mcp.insert("second".into(), server);
+        let approved = ApprovalRule::Mcp(approval.clone());
+        config.remember_approval(approved.clone());
+        let mut reopened: Config = toml::from_str(&toml::to_string(&config)?)?;
+        assert!(reopened.permits(&approved));
+        assert!(!reopened.permits(&ApprovalRule::Mcp(McpApproval {
+            server: "second".into(),
+            ..approval.clone()
+        })));
+        assert!(!reopened.permits(&ApprovalRule::Mcp(McpApproval {
+            tool: "write".into(),
+            ..approval
+        })));
+        reopened.forget_approval(&approved);
+        assert!(!reopened.permits(&approved));
+
+        config.mcp.insert(
+            "first".into(),
+            Mcp::Http {
+                url: "http://127.0.0.1:9000/mcp".into(),
+                token_env: String::new(),
+            },
+        );
+        assert!(!config.permits(&approved));
+        Ok(())
+    }
 
     #[test]
     fn remembered_cli_approvals_match_only_the_saved_scope() -> Result<()> {
