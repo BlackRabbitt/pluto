@@ -156,7 +156,6 @@ fn chat_message(
                     .show(ui, |ui| {
                         ui.set_width(inner_width);
                         ui.style_mut().url_in_tooltip = true;
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         CommonMarkViewer::new().show(ui, markdown_cache, content);
                     });
             } else {
@@ -169,6 +168,67 @@ fn chat_message(
 #[cfg(test)]
 mod chat_layout_tests {
     use super::*;
+
+    #[test]
+    fn wide_table_cells_keep_their_width_and_scroll() {
+        let context = egui::Context::default();
+        configure_fonts(&context);
+        configure_theme(&context);
+        let mut cache = CommonMarkCache::default();
+        let cell = "Wide table content that needs more room than the chat column provides";
+        let table = format!("| Name | Value |\n| --- | --- |\n| {cell} | Second column |");
+        let mut render = |events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(300.0, 420.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let width = ui.available_width();
+                            let reply = chat_message(ui, 0, width, "assistant", &table, &mut cache);
+                            assert!(reply.rect.width() <= width + 1.0);
+                        });
+                    });
+                },
+            )
+        };
+        let find_cell = |output: egui::FullOutput| {
+            output
+                .shapes
+                .into_iter()
+                .find_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == cell => {
+                        Some((text, shape.clip_rect))
+                    }
+                    _ => None,
+                })
+                .expect("The table cell should be painted")
+        };
+        render(Vec::new());
+        let (before, viewport) = find_cell(render(Vec::new()));
+        assert_eq!(
+            before.galley.rows.len(),
+            1,
+            "The cell should stay on one line"
+        );
+        assert!(before.galley.size().x > viewport.width());
+        render(vec![
+            egui::Event::PointerMoved(before.pos + egui::vec2(8.0, 8.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(-90.0, 0.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let (after, _) = find_cell(render(Vec::new()));
+        assert!(after.pos.x < before.pos.x);
+    }
 
     #[test]
     fn long_replies_fit_a_narrow_chat_column_and_render_newer_emoji() {
