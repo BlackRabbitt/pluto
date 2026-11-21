@@ -16,6 +16,25 @@ Set the working directory for terminal commands, save settings, and switch to **
 
 On Linux, the app needs a graphical desktop and working OpenGL drivers. On macOS, launch it from a terminal if your CLI or model credentials depend on your shell environment.
 
+### Use Rust 1.100.0 only for Pluto
+
+With Rustup installed, run these commands from the Pluto folder.
+
+```sh
+rustup toolchain install 1.100.0
+rustup override set 1.100.0
+rustc --version
+```
+
+`rustc --version` should report `rustc 1.100.0`. The override applies to this folder and its subfolders. To remove it, run `rustup override unset` from the Pluto folder.
+
+To share the pin with everyone who clones the repository, create and commit a `rust-toolchain.toml` file at the project root with these contents.
+
+```toml
+[toolchain]
+channel = "1.100.0"
+```
+
 ## Chat history
 
 Open a saved conversation from **Recent chats** in the sidebar or select **New chat** to start another one. The app reopens the most recently updated chat on launch. Sent messages and completed replies are saved as plain JSON in a `chats` folder beside `tools.toml`.
