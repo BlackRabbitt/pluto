@@ -116,6 +116,7 @@ fn main() -> eframe::Result {
 
 fn chat_message(
     ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
     width: f32,
     role: &str,
     content: &str,
@@ -148,6 +149,7 @@ fn chat_message(
             if assistant {
                 ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
                 egui::ScrollArea::horizontal()
+                    .id_salt(("reply", id_salt))
                     .max_width(inner_width)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
@@ -174,8 +176,9 @@ mod chat_layout_tests {
             configure_fonts(&context);
             configure_theme(&context);
             context.set_theme(theme);
+            context.options_mut(|options| options.warn_on_id_clash = true);
             let mut cache = CommonMarkCache::default();
-            let _ = context.run(
+            let output = context.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -189,18 +192,27 @@ mod chat_layout_tests {
                         let paragraph = format!("{} 🫨", "Long replies should wrap. ".repeat(20));
                         let code = format!("```text\n{}\n```", "x".repeat(180));
                         let table = "| A | B | C | D |\n| --- | --- | --- | --- |\n| Wide content | Wide content | Wide content | Wide content |";
-                        let reply = chat_message(ui, width, "assistant", &paragraph, &mut cache);
+                        let reply = chat_message(ui, 0, width, "assistant", &paragraph, &mut cache);
                         assert!(reply.rect.height() > 100.0);
                         assert!(reply.rect.width() <= width + 1.0);
-                        let reply = chat_message(ui, width, "assistant", &code, &mut cache);
+                        let reply = chat_message(ui, 1, width, "assistant", &code, &mut cache);
                         assert!(reply.rect.height() > 80.0);
                         assert!(reply.rect.width() <= width + 1.0);
-                        let reply = chat_message(ui, width, "assistant", table, &mut cache);
+                        let reply = chat_message(ui, 2, width, "assistant", table, &mut cache);
                         assert!(reply.rect.width() <= width + 1.0);
                         assert!(ui.fonts(|fonts| fonts.has_glyph(&egui::FontId::proportional(17.0), '🫨')));
                     });
                 },
             );
+            for shape in output.shapes {
+                if let egui::Shape::Text(text) = shape.shape {
+                    assert!(
+                        !text.galley.text().contains("use of ScrollArea ID"),
+                        "{}",
+                        text.galley.text()
+                    );
+                }
+            }
         }
     }
 }
@@ -1495,8 +1507,15 @@ impl eframe::App for Desktop {
                             ui.label(RichText::new("What would you like to do?").size(25.0));
                         }
                         let column_width = ui.available_width().min(ui.clip_rect().width());
-                        for (role, content) in &self.history {
-                            chat_message(ui, column_width, role, content, &mut self.markdown_cache);
+                        for (index, (role, content)) in self.history.iter().enumerate() {
+                            chat_message(
+                                ui,
+                                (&self.active_chat, index),
+                                column_width,
+                                role,
+                                content,
+                                &mut self.markdown_cache,
+                            );
                         }
                         if !self.status.is_empty() {
                             ui.horizontal(|ui| {
