@@ -172,6 +172,152 @@ mod chat_layout_tests {
     use super::*;
 
     #[test]
+    fn chat_controls_can_share_a_frame_without_widget_id_collisions() -> Result<()> {
+        let context = egui::Context::default();
+        configure_fonts(&context);
+        configure_theme(&context);
+        context.options_mut(|options| options.warn_on_id_clash = true);
+
+        let mut config = Config {
+            model_provider: Some(Provider::LlamaCpp),
+            model_url: "http://127.0.0.1:1".into(),
+            model_name: "fixture".into(),
+            ..Config::default()
+        };
+        config.add_skill(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-notes"))?;
+        let mut desktop = Desktop::with_config(config, String::new(), None, None)?;
+        desktop.sync_discovery();
+        desktop.capabilities = Lookup::Complete(Ok(ModelCapabilities {
+            thinking: Ok(vec![providers::ThinkingLevel {
+                label: "On".into(),
+                setting: ThinkingSetting::Toggle(true),
+            }]),
+            context_window: Some(8_192),
+        }));
+        desktop.context_usage = Some(TokenUsage {
+            input: 100,
+            output: 20,
+        });
+        for index in 0..3 {
+            desktop.saved_chats.push(ChatEntry {
+                path: PathBuf::from(format!("chat-{index}.json")),
+                title: "Same chat title".into(),
+            });
+        }
+        desktop.active_chat = Some(desktop.saved_chats[0].path.clone());
+        desktop.archived_chats.push(ChatEntry {
+            path: PathBuf::from("archive/chat.json"),
+            title: "Same chat title".into(),
+        });
+        let markdown = "| Name | Value |\n| --- | --- |\n| Apples | 2 |\n\n```text\nExample\n```";
+        desktop.history = vec![
+            ("user".into(), "Show the results".into()),
+            ("assistant".into(), markdown.into()),
+            ("assistant".into(), markdown.into()),
+        ];
+        desktop.prompt = "/".into();
+        desktop.picker_catalog = Lookup::Complete(Ok(PickerCatalog {
+            tools: vec![McpToolId {
+                server: "fixture".into(),
+                name: "lookup".into(),
+            }],
+            warnings: Vec::new(),
+        }));
+
+        let render = |desktop: &mut Desktop, events| {
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 850.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |context| desktop.show_ui(context),
+            );
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => {
+                        let label = text.galley.text();
+                        assert!(
+                            !(label.starts_with("🔥 ") && label.contains(" use of ")),
+                            "{label}"
+                        );
+                        Some((
+                            label.to_owned(),
+                            text.pos + text.galley.rect.center().to_vec2(),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let find_label = |labels: &[(String, egui::Pos2)], expected| {
+            labels
+                .iter()
+                .find_map(|(label, position)| (label == expected).then_some(*position))
+                .unwrap_or_else(|| panic!("Missing chat UI label {expected}"))
+        };
+        let click = |pos| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+        };
+        render(&mut desktop, Vec::new());
+        let labels = render(&mut desktop, Vec::new());
+        for expected in ["Thinking", "test-notes", "fixture / lookup"] {
+            find_label(&labels, expected);
+        }
+        assert_eq!(
+            labels.iter().filter(|(label, _)| label == "Apples").count(),
+            2
+        );
+        render(&mut desktop, click(find_label(&labels, "Archived chats")));
+        let labels = render(&mut desktop, Vec::new());
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|(label, _)| label == "Same chat title")
+                .count(),
+            4
+        );
+        render(&mut desktop, click(find_label(&labels, "Server default")));
+        let labels = render(&mut desktop, Vec::new());
+        render(&mut desktop, click(find_label(&labels, "On")));
+        assert_eq!(
+            desktop.thinking_setting,
+            Some(ThinkingSetting::Toggle(true))
+        );
+
+        desktop.prompt.clear();
+        desktop.busy = true;
+        desktop.status = "Waiting for approval · fixture / lookup".into();
+        let (reply, _decision) = oneshot::channel();
+        desktop.approval = Some(PendingApproval {
+            request: ApprovalRequest {
+                description: "Call fixture / lookup".into(),
+                rule: None,
+            },
+            reply,
+            allow_other_operands: false,
+            error: None,
+        });
+        render(&mut desktop, Vec::new());
+        let labels = render(&mut desktop, Vec::new());
+        for expected in ["Approve tool call", "Run once", "Decline"] {
+            find_label(&labels, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn wide_table_cells_keep_their_width_and_scroll() {
         let context = egui::Context::default();
         configure_fonts(&context);
@@ -400,7 +546,6 @@ struct Desktop {
 
 impl Desktop {
     fn new() -> anyhow::Result<Self> {
-        let (sender, events) = mpsc::channel();
         let (config, notice) = match Config::load() {
             Ok(config) => (config, String::new()),
             Err(error) => (
@@ -408,10 +553,20 @@ impl Desktop {
                 format!("{error:#}. Fix the file and relaunch before saving settings."),
             ),
         };
-        let (chat_store, mut history_notice) = match Config::path() {
+        let (chat_store, history_notice) = match Config::path() {
             Ok(path) => (Some(ChatStore::beside(&path)), None),
             Err(error) => (None, Some(format!("Chat history unavailable: {error:#}"))),
         };
+        Self::with_config(config, notice, chat_store, history_notice)
+    }
+
+    fn with_config(
+        config: Config,
+        notice: String,
+        chat_store: Option<ChatStore>,
+        mut history_notice: Option<String>,
+    ) -> Result<Self> {
+        let (sender, events) = mpsc::channel();
         let mut saved_chats = Vec::new();
         let mut archived_chats = Vec::new();
         let mut restored = None;
@@ -1505,6 +1660,12 @@ impl eframe::App for Desktop {
                 }
             }
         }
+        self.show_ui(context);
+    }
+}
+
+impl Desktop {
+    fn show_ui(&mut self, context: &egui::Context) {
         egui::SidePanel::left("navigation")
             .exact_width(213.0)
             .resizable(false)
