@@ -47,6 +47,17 @@ Open a saved conversation from **Recent chats** in the sidebar or select **New c
 
 Pluto registers a path to the skill and reads its instructions when requested. Keep the skill folder available. For a skill from a repository, check it out locally and register that folder. The terminal tool runs an executable with separate arguments in the configured working directory. It is noninteractive and runs with your account's privileges. An explicit shell command can be approved if you need pipes or redirects.
 
+### Update a skill
+
+| What changed | What to do |
+| --- | --- |
+| Instructions in `SKILL.md` | Save the file in place. Pluto reads the updated instructions the next time the model loads the skill, even in the same chat. |
+| Skill description | In **Settings → Skills**, add the same file again and click **Save settings**. This refreshes the description the model sees when choosing a skill. |
+| Skill name or file location | Remove the old entry in **Settings → Skills**, add the updated file, and click **Save settings**. |
+| Skill files in a GitHub repository | Update your local copy first. Then follow the row above for what changed. |
+
+To try an update right away, ask Pluto to use the skill by name in your next message.
+
 ### Try the test notes app
 
 With Python 3 installed, run these commands from the project root:
