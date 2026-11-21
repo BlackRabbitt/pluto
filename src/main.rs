@@ -148,16 +148,18 @@ fn chat_message(
                     .color(ui.visuals().hyperlink_color),
             );
             if assistant {
-                ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-                egui::ScrollArea::horizontal()
-                    .id_salt(("reply", id_salt))
-                    .max_width(inner_width)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.set_width(inner_width);
-                        ui.style_mut().url_in_tooltip = true;
-                        CommonMarkViewer::new().show(ui, markdown_cache, content);
-                    });
+                // Markdown tables derive their IDs from the reply's UI scope.
+                ui.push_id(("reply", id_salt), |ui| {
+                    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                    egui::ScrollArea::horizontal()
+                        .max_width(inner_width)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.set_width(inner_width);
+                            ui.style_mut().url_in_tooltip = true;
+                            CommonMarkViewer::new().show(ui, markdown_cache, content);
+                        });
+                });
             } else {
                 ui.add(egui::Label::new(content).wrap().selectable(true));
             }
@@ -174,6 +176,7 @@ mod chat_layout_tests {
         let context = egui::Context::default();
         configure_fonts(&context);
         configure_theme(&context);
+        context.options_mut(|options| options.warn_on_id_clash = true);
         let mut cache = CommonMarkCache::default();
         let cell = "Wide table content that needs more room than the chat column provides";
         let table = format!("| Name | Value |\n| --- | --- |\n| {cell} | Second column |");
@@ -193,6 +196,14 @@ mod chat_layout_tests {
                             let width = ui.available_width();
                             let reply = chat_message(ui, 0, width, "assistant", &table, &mut cache);
                             assert!(reply.rect.width() <= width + 1.0);
+                            chat_message(
+                                ui,
+                                1,
+                                width,
+                                "assistant",
+                                "| Item | Count |\n| --- | --- |\n| Apples | 2 |",
+                                &mut cache,
+                            );
                         });
                     });
                 },
@@ -211,7 +222,14 @@ mod chat_layout_tests {
                 .expect("The table cell should be painted")
         };
         render(Vec::new());
-        let (before, viewport) = find_cell(render(Vec::new()));
+        let output = render(Vec::new());
+        for shape in &output.shapes {
+            if let egui::Shape::Text(text) = &shape.shape {
+                let label = text.galley.text();
+                assert!(!label.contains("use of Grid ID"), "{label}");
+            }
+        }
+        let (before, viewport) = find_cell(output);
         assert_eq!(
             before.galley.rows.len(),
             1,
