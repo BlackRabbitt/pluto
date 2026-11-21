@@ -29,7 +29,39 @@ def mcp(request):
     return {"jsonrpc": "2.0", "id": request["id"], "result": result}
 
 
+def tool_call(step, name, arguments):
+    return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+        "id": f"call_{step}", "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }]}}]}
+
+
+def tool_discovery_model(request):
+    names = [tool["function"]["name"] for tool in request["tools"]]
+    visible = [name for name in names if name.startswith("mcp_")]
+    results = [item["content"] for item in request["messages"] if item["role"] == "tool"]
+    assert "find_tools" in names
+    if not results:
+        assert not visible
+        return tool_call(0, "find_tools", {"query": "lookup", "server": "fixture"})
+    if len(results) == 1:
+        matches = json.loads(results[0])["matches"]
+        assert [match["server"] for match in matches] == ["fixture"]
+        assert visible == [matches[0]["name"]]
+        return tool_call(1, "find_tools", {"query": "secondary lookup"})
+    if len(results) == 2:
+        fixture_tool = json.loads(results[0])["matches"][0]["name"]
+        matches = json.loads(results[1])["matches"]
+        assert [match["server"] for match in matches] == ["secondary"]
+        assert set(visible) == {fixture_tool, matches[0]["name"]}
+        return tool_call(2, fixture_tool, {})
+    assert len(results) == 3 and "fixture lookup succeeded" in results[-1]
+    return {"choices": [{"message": {"content": "MCP discovery fixture passed"}}]}
+
+
 def model(request):
+    if request["model"] == "find-tools-fixture":
+        return tool_discovery_model(request)
     if request["model"] == "toggle fixture":
         assert "reasoning_effort" not in request
         assert request["reasoning_format"] == "auto"
@@ -70,10 +102,7 @@ def model(request):
     else:
         assert len(messages) == 6 and "declined" in messages[-1]["content"]
         return {"choices": [{"message": {"role": "assistant", "content": "Pluto fixture passed"}}]}
-    return {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
-        "id": f"call_{len(messages)}", "type": "function",
-        "function": {"name": name, "arguments": json.dumps(arguments)},
-    }]}}]}
+    return tool_call(len(messages), name, arguments)
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -3,7 +3,7 @@ use crate::providers::{Connection, ThinkingSetting};
 use crate::tools::{ApprovalRequest, Config, ToolSet};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 use tokio::sync::oneshot;
 
 pub enum Event {
@@ -56,7 +56,8 @@ pub async fn chat(
     let model = config.model_name.trim();
     let catalog = config.skill_catalog();
     let tools = ToolSet::connect(&config, |message| emit(Event::Warning(message))).await;
-    let definitions = tools.definitions();
+    let mut active_mcp_tools = tools.initial_mcp_tools();
+    let mut definitions = tools.definitions(&active_mcp_tools);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
@@ -119,6 +120,7 @@ pub async fn chat(
         messages
             .push(json!({"role":"assistant", "content":message["content"], "tool_calls":calls}));
 
+        let mut newly_found = BTreeSet::new();
         for call in calls {
             let id = call["id"].as_str().context("Model tool call lacks an ID")?;
             let name = call["function"]["name"]
@@ -126,6 +128,15 @@ pub async fn chat(
                 .context("Model tool call lacks a name")?;
             let raw = call["function"]["arguments"].as_str().unwrap_or("{}");
             let result = match serde_json::from_str::<Value>(raw) {
+                Ok(args) if args.is_object() && name == "find_tools" => {
+                    emit(Event::Status("Running · Find MCP tools".into()));
+                    tools.find_tools(args, &mut newly_found)
+                }
+                Ok(args) if args.is_object() && tools.needs_discovery(name, &active_mcp_tools) => {
+                    Err(anyhow::anyhow!(
+                        "Use find_tools to make this MCP tool available first"
+                    ))
+                }
                 Ok(args) if args.is_object() => {
                     let activity = tools.activity(name, &args);
                     let mut running = format!("Running · {activity}");
@@ -158,6 +169,11 @@ pub async fn chat(
                 output
             };
             messages.push(json!({"role":"tool","tool_call_id":id,"content":content}));
+        }
+        let previous_count = active_mcp_tools.len();
+        active_mcp_tools.extend(newly_found);
+        if active_mcp_tools.len() != previous_count {
+            definitions = tools.definitions(&active_mcp_tools);
         }
     }
     anyhow::bail!("Stopped after 12 model steps")

@@ -186,6 +186,52 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
 }
 
 #[tokio::test]
+async fn find_tools_exposes_fixture_schemas_on_demand() -> Result<()> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
+    let (_http, port) = http_fixture(&script).await?;
+    let other_server = Mcp::Http {
+        url: format!("http://127.0.0.1:{port}/mcp"),
+        token_env: String::new(),
+    };
+    let mut config = Config {
+        model_provider: Some(Provider::OpenAiCompatible),
+        model_url: format!("http://127.0.0.1:{port}/v1"),
+        model_name: "find-tools-fixture".into(),
+        mcp: ["secondary", "extra-a", "extra-b"]
+            .into_iter()
+            .map(|name| (name.to_owned(), other_server.clone()))
+            .collect(),
+        ..Config::default()
+    };
+    config.mcp.insert(
+        "fixture".into(),
+        Mcp::Stdio {
+            command: "python3".into(),
+            args: vec![script.display().to_string(), "stdio".into()],
+        },
+    );
+    let approvals = std::cell::Cell::new(0);
+    let result = chat(
+        config,
+        vec![("user".into(), "Find and use the fixture lookup tool".into())],
+        None,
+        |event| match event {
+            Event::Approve(request, reply) => {
+                assert!(request.description.starts_with("Call fixture / lookup"));
+                approvals.set(approvals.get() + 1);
+                let _ = reply.send(ApprovalDecision::RunOnce);
+            }
+            Event::Warning(warning) => panic!("Unexpected discovery warning: {warning}"),
+            _ => {}
+        },
+    )
+    .await?;
+    assert_eq!(result, "MCP discovery fixture passed");
+    assert_eq!(approvals.get(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;

@@ -12,7 +12,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::Write,
     path::{Path, PathBuf},
@@ -448,6 +448,14 @@ pub struct ToolSet<'a> {
     remote: BTreeMap<String, RemoteTool>,
 }
 
+const EAGER_MCP_TOOL_LIMIT: usize = 3;
+const EAGER_MCP_SCHEMA_BYTES: usize = 8_192;
+
+fn search_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+}
+
 fn function(name: &str, description: &str, parameters: Value) -> Value {
     json!({"type":"function","function":{
         "name":name,"description":description,"parameters":parameters
@@ -589,7 +597,22 @@ impl<'a> ToolSet<'a> {
         set
     }
 
-    pub fn definitions(&self) -> Vec<Value> {
+    pub fn initial_mcp_tools(&self) -> BTreeSet<String> {
+        if self.remote.len() <= EAGER_MCP_TOOL_LIMIT
+            && self
+                .remote
+                .values()
+                .map(|tool| tool.definition.to_string().len())
+                .sum::<usize>()
+                <= EAGER_MCP_SCHEMA_BYTES
+        {
+            self.remote.keys().cloned().collect()
+        } else {
+            BTreeSet::new()
+        }
+    }
+
+    pub fn definitions(&self, active_mcp_tools: &BTreeSet<String>) -> Vec<Value> {
         let mut tools = vec![function(
             "terminal",
             "Run an installed executable in the user's configured workspace after desktop approval. Pass CLI arguments separately. For shell pipelines, explicitly request a shell executable and pass its script as an argument.",
@@ -608,8 +631,85 @@ impl<'a> ToolSet<'a> {
                 }),
             ));
         }
-        tools.extend(self.remote.values().map(|tool| tool.definition.clone()));
+        if !self.remote.is_empty() {
+            tools.push(function(
+                "find_tools",
+                "Find the best MCP tool for one action or name. Optionally limit the search by configured server name. The best match becomes callable on the next model request. Search again if you need a follow-up tool.",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "query":{"type":"string","description":"The tool name or the action you need"},
+                        "server":{"type":"string","description":"Optional MCP server name as configured in Pluto"}
+                    },
+                    "required":["query"],
+                    "additionalProperties":false
+                }),
+            ));
+        }
+        tools.extend(
+            active_mcp_tools
+                .iter()
+                .filter_map(|name| self.remote.get(name))
+                .map(|tool| tool.definition.clone()),
+        );
         tools
+    }
+
+    pub fn needs_discovery(&self, name: &str, active_mcp_tools: &BTreeSet<String>) -> bool {
+        self.remote.contains_key(name) && !active_mcp_tools.contains(name)
+    }
+
+    pub fn find_tools(&self, args: Value, found: &mut BTreeSet<String>) -> Result<String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Query {
+            query: String,
+            server: Option<String>,
+        }
+
+        let query: Query = serde_json::from_value(args)?;
+        let terms = query.query.to_lowercase();
+        let terms: BTreeSet<_> = search_words(&terms).collect();
+        ensure!(!terms.is_empty(), "Enter a tool name or an action to find");
+        let server = query.server.as_deref().map(str::trim);
+        let mut best = None;
+        for (alias, tool) in &self.remote {
+            if server.is_some_and(|name| !name.eq_ignore_ascii_case(&tool.server_name)) {
+                continue;
+            }
+            let target = tool.target.to_lowercase();
+            let description = tool.definition["function"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase();
+            let score = terms
+                .iter()
+                .map(|term| {
+                    if search_words(&target).any(|word| word == *term) {
+                        3
+                    } else if search_words(&description).any(|word| word == *term) {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .sum::<usize>();
+            if score > 0
+                && best
+                    .as_ref()
+                    .is_none_or(|(best_score, _, _)| score > *best_score)
+            {
+                best = Some((score, alias, tool));
+            }
+        }
+        let matches: Vec<_> = best
+            .into_iter()
+            .map(|(_, alias, tool)| {
+                found.insert(alias.clone());
+                json!({"name": alias, "server": tool.server_name, "summary": tool.activity})
+            })
+            .collect();
+        Ok(json!({"matches": matches}).to_string())
     }
 
     pub fn approval(&self, name: &str, args: &Value) -> Option<ApprovalRequest> {

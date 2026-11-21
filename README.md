@@ -82,6 +82,8 @@ Use **Test connection** to check the form, or **Test** next to an existing entry
 
 Choose **Run always** to approve future calls to that specific tool on the same server configuration, including calls with different arguments. Matching calls show **Auto-approved** in Chat. Use **Settings → Saved approvals** to forget an approval.
 
+When the MCP catalog is large, Pluto gives the model a `find_tools` tool to search names and descriptions. Each search loads the best match for the current turn and can be limited to a server by its name in Settings. The model can search again for a follow-up tool. The usual approval rules apply. Small catalogs are available directly.
+
 For Slack, register a configured Slack MCP server using either transport. Slack's [official hosted endpoint](https://docs.slack.dev/ai/slack-mcp-server/) requires a registered Slack app and OAuth. This build accepts a caller-supplied bearer token for compatible HTTP servers. It does not run the Slack authorization flow or refresh credentials. A Slack MCP server that handles its own credentials can be registered as a local process.
 
 A web-search MCP server can be registered in the same way. There is no separate built-in browser or web-search implementation.
