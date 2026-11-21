@@ -193,17 +193,24 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
         assert_eq!(note, json!({"id": 1, "title": "Shopping"}));
         drop(tools);
         let approved = std::cell::Cell::new(false);
+        let skill_loaded = std::cell::Cell::new(false);
         let answer = chat(
             config,
             vec![("user".into(), "List my notes".into())],
             None,
             Some(TurnSelection::Skill(name)),
-            |event| {
-                if let Event::Approve(request, reply) = event {
+            |event| match event {
+                Event::SkillLoaded(name) => {
+                    assert_eq!(name, "test-notes");
+                    skill_loaded.set(true);
+                }
+                Event::Approve(request, reply) => {
+                    assert!(skill_loaded.get());
                     assert!(request.description.contains("notes.py"));
                     approved.set(true);
                     let _ = reply.send(ApprovalDecision::RunOnce);
                 }
+                _ => {}
             },
         )
         .await?;
@@ -334,6 +341,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
 
     let approvals = std::cell::RefCell::new(Vec::new());
     let statuses = std::cell::RefCell::new(Vec::new());
+    let loaded_skills = std::cell::RefCell::new(Vec::new());
     let remembered = std::cell::RefCell::new(config.clone());
     let result = chat(
         config,
@@ -342,6 +350,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
         None,
         |event| match event {
             Event::Status(status) => statuses.borrow_mut().push(status),
+            Event::SkillLoaded(name) => loaded_skills.borrow_mut().push(name),
             Event::Approve(request, reply) => {
                 let decision = if request.description.contains("should be declined") {
                     ApprovalDecision::Decline
@@ -370,6 +379,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
     .await;
     fs::remove_dir_all(&directory)?;
     assert_eq!(result?, "Pluto fixture passed");
+    assert_eq!(loaded_skills.into_inner(), ["notes"]);
     assert_eq!(approvals.into_inner().len(), 5);
     let statuses = statuses.into_inner();
     assert!(

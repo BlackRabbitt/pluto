@@ -14,6 +14,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use history::{ChatEntry, ChatStore, Messages};
 use providers::{Connection, ModelCapabilities, Provider, ThinkingSetting};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::{Path, PathBuf},
     sync::mpsc,
@@ -304,6 +305,7 @@ struct Desktop {
     settings: bool,
     busy: bool,
     status: String,
+    loaded_skills: BTreeMap<usize, BTreeSet<String>>,
     notice: String,
     connection_errors: Vec<String>,
     config_error: bool,
@@ -404,6 +406,7 @@ impl Desktop {
             picker_index: 0,
             busy: false,
             status: String::new(),
+            loaded_skills: BTreeMap::new(),
             connection_errors: Vec::new(),
             approval: None,
             skill_path: String::new(),
@@ -425,7 +428,11 @@ impl Desktop {
             self.notice = "Choose a provider, enter its server URL, and select a model.".into();
             return;
         }
-        self.status = "Discovering tools…".into();
+        let selection = self.selection.take();
+        self.status = match &selection {
+            Some(TurnSelection::Skill(name)) => format!("Preparing to load skill · {name}…"),
+            _ => "Discovering tools…".into(),
+        };
         self.connection_errors.clear();
         self.busy = true;
         self.history
@@ -435,7 +442,6 @@ impl Desktop {
         let config = self.config.clone();
         let history = self.history.clone();
         let thinking = self.thinking_setting.clone();
-        let selection = self.selection.take();
         let sender = self.sender.clone();
         let context = context.clone();
         self.runtime.spawn(async move {
@@ -674,6 +680,7 @@ impl Desktop {
         self.active_chat = path;
         self.selection = None;
         self.history = history;
+        self.loaded_skills.clear();
         self.context_usage = None;
         self.status.clear();
         self.connection_errors.clear();
@@ -1374,6 +1381,11 @@ impl eframe::App for Desktop {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Status(status) => self.status = status,
+                Event::SkillLoaded(name) => {
+                    if let Some(index) = self.history.len().checked_sub(1) {
+                        self.loaded_skills.entry(index).or_default().insert(name);
+                    }
+                }
                 Event::Warning(warning) => self.connection_errors.push(warning),
                 Event::Approve(request, reply) => {
                     if request
@@ -1516,6 +1528,18 @@ impl eframe::App for Desktop {
                                 content,
                                 &mut self.markdown_cache,
                             );
+                            if let Some(skills) = self.loaded_skills.get(&index) {
+                                for name in skills {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!("Skill loaded · {name}"))
+                                                .small()
+                                                .color(ui.visuals().hyperlink_color),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            }
                         }
                         if !self.status.is_empty() {
                             ui.horizontal(|ui| {

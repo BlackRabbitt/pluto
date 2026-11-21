@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 
 pub enum Event {
     Status(String),
+    SkillLoaded(String),
     Warning(String),
     Approve(ApprovalRequest, oneshot::Sender<ApprovalDecision>),
     Usage {
@@ -114,7 +115,9 @@ pub async fn chat(
     );
     if let Some(TurnSelection::Skill(name)) = selection {
         let arguments = json!({"name": name});
-        let instructions = tools.call("load_skill", arguments.clone()).await?;
+        let instructions = load_skill(&tools, arguments.clone(), &emit)
+            .await
+            .with_context(|| format!("Could not load skill {name}"))?;
         let call_id = "call_pluto_selected_skill";
         messages.push(json!({
             "role": "assistant", "content": null, "tool_calls": [{
@@ -179,6 +182,9 @@ pub async fn chat(
                     emit(Event::Status("Running · Find MCP tools".into()));
                     tools.find_tools(args, &mut newly_found)
                 }
+                Ok(args) if args.is_object() && name == "load_skill" => {
+                    load_skill(&tools, args, &emit).await
+                }
                 Ok(args) if args.is_object() && tools.needs_discovery(name, &active_mcp_tools) => {
                     Err(anyhow::anyhow!(
                         "Use find_tools to make this MCP tool available first"
@@ -219,6 +225,20 @@ pub async fn chat(
         }
     }
     anyhow::bail!("Stopped after 12 model steps")
+}
+
+async fn load_skill(tools: &ToolSet<'_>, args: Value, emit: &impl Fn(Event)) -> Result<String> {
+    emit(Event::Status(format!(
+        "Running · {}",
+        tools.activity("load_skill", &args)
+    )));
+    let name = args["name"]
+        .as_str()
+        .context("Expected a skill name")?
+        .to_owned();
+    let instructions = tools.call("load_skill", args).await?;
+    emit(Event::SkillLoaded(name));
+    Ok(instructions)
 }
 
 fn bounded_tool_output(output: String) -> String {
