@@ -146,7 +146,7 @@ fn chat_message(
                     .color(ui.visuals().hyperlink_color),
             );
             if assistant {
-                // Wide grids can scroll sideways within the reply. Prose and code still wrap.
+                ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
                 egui::ScrollArea::horizontal()
                     .max_width(inner_width)
                     .auto_shrink([false, true])
