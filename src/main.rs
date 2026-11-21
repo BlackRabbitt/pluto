@@ -24,6 +24,22 @@ use tools::{ApprovalRequest, ApprovalRule, Config, Mcp, McpToolId, ToolSet};
 
 const APP_NAME: &str = "Pluto";
 
+fn configure_fonts(context: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    // Updated monochrome Noto Emoji from Google Fonts. See the bundled OFL.
+    let name = "Noto Emoji".to_owned();
+    let fallback = egui::FontData::from_static(include_bytes!("../assets/fonts/NotoEmoji.ttf"))
+        .tweak(egui::FontTweak {
+            scale: 0.9,
+            ..Default::default()
+        });
+    fonts.font_data.insert(name.clone(), fallback.into());
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push(name.clone());
+    }
+    context.set_fonts(fonts);
+}
+
 fn configure_theme(context: &egui::Context) {
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
         let (mut visuals, canvas, surface, text, muted, accent, selection, border, warning) =
@@ -91,10 +107,102 @@ fn main() -> eframe::Result {
         APP_NAME,
         options,
         Box::new(|cc| {
+            configure_fonts(&cc.egui_ctx);
             configure_theme(&cc.egui_ctx);
             Ok(Box::new(Desktop::new()?))
         }),
     )
+}
+
+fn chat_message(
+    ui: &mut egui::Ui,
+    width: f32,
+    role: &str,
+    content: &str,
+    markdown_cache: &mut CommonMarkCache,
+) -> egui::Response {
+    let assistant = role == "assistant";
+    let background = if assistant {
+        if ui.visuals().dark_mode {
+            Color32::from_rgb(33, 60, 48)
+        } else {
+            Color32::from_rgb(224, 240, 231)
+        }
+    } else {
+        ui.visuals().window_fill
+    };
+    Frame::new()
+        .fill(background)
+        .stroke(ui.visuals().window_stroke)
+        .corner_radius(9)
+        .inner_margin(Margin::same(14))
+        .show(ui, |ui| {
+            // Bound the inner width to the visible column before any Markdown expands it.
+            let inner_width = (width - 28.0 - 2.0 * ui.visuals().window_stroke.width).max(1.0);
+            ui.set_width(inner_width);
+            ui.label(
+                RichText::new(if role == "user" { "You" } else { APP_NAME })
+                    .strong()
+                    .color(ui.visuals().hyperlink_color),
+            );
+            if assistant {
+                // Wide grids can scroll sideways within the reply. Prose and code still wrap.
+                egui::ScrollArea::horizontal()
+                    .max_width(inner_width)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(inner_width);
+                        ui.style_mut().url_in_tooltip = true;
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        CommonMarkViewer::new().show(ui, markdown_cache, content);
+                    });
+            } else {
+                ui.add(egui::Label::new(content).wrap().selectable(true));
+            }
+        })
+        .response
+}
+
+#[cfg(test)]
+mod chat_layout_tests {
+    use super::*;
+
+    #[test]
+    fn long_replies_fit_a_narrow_chat_column_and_render_newer_emoji() {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let context = egui::Context::default();
+            configure_fonts(&context);
+            configure_theme(&context);
+            context.set_theme(theme);
+            let mut cache = CommonMarkCache::default();
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(300.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let width = ui.available_width();
+                        let paragraph = format!("{} 🫨", "Long replies should wrap. ".repeat(20));
+                        let code = format!("```text\n{}\n```", "x".repeat(180));
+                        let table = "| A | B | C | D |\n| --- | --- | --- | --- |\n| Wide content | Wide content | Wide content | Wide content |";
+                        let reply = chat_message(ui, width, "assistant", &paragraph, &mut cache);
+                        assert!(reply.rect.height() > 100.0);
+                        assert!(reply.rect.width() <= width + 1.0);
+                        let reply = chat_message(ui, width, "assistant", &code, &mut cache);
+                        assert!(reply.rect.height() > 80.0);
+                        assert!(reply.rect.width() <= width + 1.0);
+                        let reply = chat_message(ui, width, "assistant", table, &mut cache);
+                        assert!(reply.rect.width() <= width + 1.0);
+                        assert!(ui.fonts(|fonts| fonts.has_glyph(&egui::FontId::proportional(17.0), '🫨')));
+                    });
+                },
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1386,34 +1494,9 @@ impl eframe::App for Desktop {
                             ui.add_space(52.0);
                             ui.label(RichText::new("What would you like to do?").size(25.0));
                         }
+                        let column_width = ui.available_width().min(ui.clip_rect().width());
                         for (role, content) in &self.history {
-                            Frame::new()
-                                .fill(ui.visuals().window_fill)
-                                .stroke(ui.visuals().window_stroke)
-                                .corner_radius(9)
-                                .inner_margin(Margin::same(14))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.label(
-                                        RichText::new(if role == "user" {
-                                            "You"
-                                        } else {
-                                            APP_NAME
-                                        })
-                                        .strong()
-                                        .color(ui.visuals().hyperlink_color),
-                                    );
-                                    if role == "assistant" {
-                                        ui.style_mut().url_in_tooltip = true;
-                                        CommonMarkViewer::new().show(
-                                            ui,
-                                            &mut self.markdown_cache,
-                                            content,
-                                        );
-                                    } else {
-                                        ui.add(egui::Label::new(content).wrap().selectable(true));
-                                    }
-                                });
+                            chat_message(ui, column_width, role, content, &mut self.markdown_cache);
                         }
                         if !self.status.is_empty() {
                             ui.horizontal(|ui| {
