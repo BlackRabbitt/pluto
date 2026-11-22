@@ -121,6 +121,31 @@ Manage these options under **Settings → Tool approvals**. Use **Saved approval
 
 These live together under `~/Library/Application Support/pluto/` on macOS, or under `pluto/` in the OS user config directory. Set `PLUTO_CONFIG` to choose a different settings file. Chats and logs sit beside it. On first launch, Pluto moves the previous default data folder if the new one does not yet exist.
 
-If a batch would exceed **52 tool calls** in a message, Pluto skips that batch and asks for a partial answer using the results already gathered. In the log, group entries by `process` and `turn`. Identical argument text shares an `arguments_id` within a turn. The log includes metadata and names and omits prompts, raw arguments, credentials, and tool output. Pluto keeps the current and previous log, up to 2 MiB each.
+If a batch would exceed **52 tool calls** in a message, Pluto skips that batch and asks for a partial answer using the results already gathered.
+
+### Check diagnostics
+
+Send a chat message to create the log. On macOS, run this in a terminal to watch events as Pluto writes them. Press **Ctrl+C** to stop.
+
+```sh
+tail -f "$HOME/Library/Application Support/pluto/agent-debug.jsonl"
+```
+
+If you have `jq`, use this to show one line per event for the turn that most recently wrote to the current log. The command groups events by `process` and `turn`.
+
+```sh
+jq -rs '
+  last as $latest
+  | .[]
+  | select(.process == $latest.process and .turn == $latest.turn)
+  | [.event, (.details | tojson)]
+  | @tsv
+' "$HOME/Library/Application Support/pluto/agent-debug.jsonl"
+```
+
+If you set `PLUTO_CONFIG`, use the `agent-debug.jsonl` beside that settings file. The log records metadata and names and omits prompts, raw arguments, credentials, and tool output. Identical argument text shares an `arguments_id` within a turn. Pluto keeps the current log and `agent-debug.previous.jsonl`, up to 2 MiB each.
+
+- To follow tool discovery, look for `tool_requested` with `"tool":"find_tools"`. The `mcp_tools_matched` event lists matched aliases for that batch when there are any. The next `model_request` reports `tools_offered`.
+- For a background job, `tool_finished` with `"outcome":"returned"` marks when the tool returned its response. A status check, if the model requests one, appears as a separate tool call.
 
 For code changes, see the [development guide](DEVELOPMENT.md).
