@@ -440,8 +440,24 @@ struct RemoteTool {
     server_name: String,
     name: String,
     target: String,
-    activity: String,
+    activity: ToolActivity,
     definition: Value,
+}
+
+#[derive(Clone)]
+pub struct ToolActivity {
+    pub name: String,
+    pub action: Option<String>,
+}
+
+impl std::fmt::Display for ToolActivity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)?;
+        if let Some(action) = &self.action {
+            write!(f, " · {action}")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -478,7 +494,7 @@ fn activity_text(text: &str) -> String {
     }
 }
 
-fn terminal_activity(args: &Value) -> String {
+fn terminal_activity(args: &Value) -> ToolActivity {
     let command = args["command"]
         .as_str()
         .and_then(|path| Path::new(path).file_name()?.to_str())
@@ -520,13 +536,17 @@ fn terminal_activity(args: &Value) -> String {
                 | "update"
         )
     });
-    activity_text(
-        &[Some(command), script, operation]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    let name = script.map_or_else(
+        || command.to_owned(),
+        |script| format!("{command} {script}"),
+    );
+    ToolActivity {
+        name: activity_text(&name),
+        action: Some(operation.map_or_else(
+            || "Run terminal command".into(),
+            |operation| format!("Run {operation}"),
+        )),
+    }
 }
 
 impl<'a> ToolSet<'a> {
@@ -565,9 +585,9 @@ impl<'a> ToolSet<'a> {
                         .flatten()
                         .map(activity_text)
                         .find(|text| !text.is_empty());
-                        let activity = match purpose {
-                            Some(purpose) => format!("{} · {purpose}", activity_text(&target)),
-                            None => activity_text(&target),
+                        let activity = ToolActivity {
+                            name: activity_text(&target),
+                            action: purpose,
                         };
                         let slug = format!("{name}_{}", tool.name)
                             .chars()
@@ -733,7 +753,7 @@ impl<'a> ToolSet<'a> {
             .into_iter()
             .map(|(_, alias, tool)| {
                 found.insert(alias.clone());
-                json!({"name": alias, "server": tool.server_name, "summary": tool.activity})
+                json!({"name": alias, "server": tool.server_name, "summary": tool.activity.to_string()})
             })
             .collect();
         Ok(json!({"matches": matches}).to_string())
@@ -771,17 +791,27 @@ impl<'a> ToolSet<'a> {
         })
     }
 
-    pub fn activity(&self, name: &str, args: &Value) -> String {
+    pub fn activity(&self, name: &str, args: &Value) -> ToolActivity {
         match name {
             "terminal" => terminal_activity(args),
-            "load_skill" => match args["name"].as_str().filter(|name| valid_name(name)) {
-                Some(name) => format!("Load skill {name}"),
-                None => "Load skill".into(),
+            "find_tools" => ToolActivity {
+                name: "MCP tool discovery".into(),
+                action: Some("Find a matching tool".into()),
             },
-            _ => self
-                .remote
-                .get(name)
-                .map_or_else(|| activity_text(name), |tool| tool.activity.clone()),
+            "load_skill" => ToolActivity {
+                name: args["name"]
+                    .as_str()
+                    .filter(|name| valid_name(name))
+                    .map_or_else(|| "Skill".into(), activity_text),
+                action: Some("Load skill instructions".into()),
+            },
+            _ => self.remote.get(name).map_or_else(
+                || ToolActivity {
+                    name: activity_text(name),
+                    action: None,
+                },
+                |tool| tool.activity.clone(),
+            ),
         }
     }
 

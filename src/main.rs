@@ -8,7 +8,7 @@ mod tools;
 #[path = "../tests/support/chat.rs"]
 mod chat_test;
 
-use agent::{ApprovalDecision, Event, TokenUsage, TurnSelection};
+use agent::{ApprovalDecision, Event, TokenUsage, ToolPhase, ToolProgress, TurnSelection};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -103,22 +103,33 @@ fn configure_theme(context: &egui::Context) {
 fn main() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/pluto-icon.png"))
         .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+    let icon = std::sync::Arc::new(icon);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 690.0])
             .with_min_inner_size([700.0, 530.0])
-            .with_icon(icon),
+            .with_icon(icon.clone()),
         ..Default::default()
     };
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             configure_fonts(&cc.egui_ctx);
             configure_theme(&cc.egui_ctx);
-            Ok(Box::new(Desktop::new()?))
+            let mut desktop = Desktop::new()?;
+            desktop.logo = Some(load_logo(&cc.egui_ctx, &icon));
+            Ok(Box::new(desktop))
         }),
     )
+}
+
+fn load_logo(context: &egui::Context, icon: &egui::IconData) -> egui::TextureHandle {
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    context.load_texture("pluto-logo", image, egui::TextureOptions::LINEAR)
 }
 
 fn chat_message(
@@ -183,6 +194,31 @@ fn chat_message(
             }
         })
         .response
+}
+
+fn tool_progress_ui(ui: &mut egui::Ui, tool: &ToolProgress) {
+    let status = match tool.phase {
+        ToolPhase::AwaitingApproval => "Waiting for approval",
+        ToolPhase::Running => "Waiting for result",
+        ToolPhase::AutoApproved => "Waiting for result · Auto-approved",
+        ToolPhase::GloballyAutoApproved => "Waiting for result · Auto-approved · Global setting",
+    };
+    let elapsed = tool.started.elapsed().as_secs();
+    let details = match &tool.activity.action {
+        Some(action) => format!("{action} · {status} · {elapsed}s"),
+        None => format!("{status} · {elapsed}s"),
+    };
+    ui.horizontal_top(|ui| {
+        if tool.phase != ToolPhase::AwaitingApproval {
+            ui.spinner();
+        }
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add(egui::Label::new(RichText::new(&tool.activity.name).small().strong()).wrap());
+            ui.add(egui::Label::new(RichText::new(details).small().weak()).wrap());
+        });
+    });
+    ui.ctx().request_repaint_after(Duration::from_secs(1));
 }
 
 #[cfg(test)]
@@ -396,7 +432,28 @@ mod chat_layout_tests {
 
         desktop.prompt.clear();
         desktop.busy = true;
-        desktop.status = "Waiting for approval · fixture / lookup".into();
+        desktop.tool_progress = Some(ToolProgress {
+            activity: tools::ToolActivity {
+                name: "fixture / lookup".into(),
+                action: Some("Look up the fixture".into()),
+            },
+            phase: ToolPhase::GloballyAutoApproved,
+            started: std::time::Instant::now() - Duration::from_secs(8),
+        });
+        let labels = render(&mut desktop, Vec::new());
+        let name = find_label(&labels, "fixture / lookup");
+        let (seconds, details) = labels.iter().find_map(|(label, position)| {
+            let seconds = label.strip_prefix("Look up the fixture · Waiting for result · Auto-approved · Global setting · ")?
+                .strip_suffix('s')?.parse::<u64>().ok()?;
+            Some((seconds, position))
+        }).context("Missing running tool details")?;
+        assert!(seconds >= 8);
+        assert!(name.y < details.y);
+        desktop
+            .tool_progress
+            .as_mut()
+            .expect("Tool is active")
+            .phase = ToolPhase::AwaitingApproval;
         let (reply, _decision) = oneshot::channel();
         desktop.approval = Some(PendingApproval {
             request: ApprovalRequest {
@@ -603,6 +660,7 @@ struct PickerCatalog {
 }
 
 struct Desktop {
+    logo: Option<egui::TextureHandle>,
     runtime: tokio::runtime::Runtime,
     events: mpsc::Receiver<Event>,
     sender: mpsc::Sender<Event>,
@@ -630,6 +688,7 @@ struct Desktop {
     settings: bool,
     busy: bool,
     status: String,
+    tool_progress: Option<ToolProgress>,
     loaded_skills: BTreeMap<usize, BTreeSet<String>>,
     notice: String,
     connection_errors: Vec<String>,
@@ -720,6 +779,7 @@ impl Desktop {
             None => (None, ChatHistory::default()),
         };
         Ok(Self {
+            logo: None,
             runtime: tokio::runtime::Runtime::new()?,
             settings: config.model_name.trim().is_empty() || config.model_connection().is_err(),
             workspace: config.workspace.display().to_string(),
@@ -753,6 +813,7 @@ impl Desktop {
             picker_index: 0,
             busy: false,
             status: String::new(),
+            tool_progress: None,
             loaded_skills: BTreeMap::new(),
             connection_errors: Vec::new(),
             approval: None,
@@ -780,6 +841,7 @@ impl Desktop {
             Some(TurnSelection::Skill(name)) => format!("Preparing to load skill · {name}…"),
             _ => "Discovering tools…".into(),
         };
+        self.tool_progress = None;
         self.connection_errors.clear();
         self.busy = true;
         self.history.push("user", std::mem::take(&mut self.prompt));
@@ -1041,6 +1103,7 @@ impl Desktop {
         self.loaded_skills.clear();
         self.context_usage = None;
         self.status.clear();
+        self.tool_progress = None;
         self.connection_errors.clear();
         self.history_notice = None;
     }
@@ -1748,7 +1811,11 @@ impl eframe::App for Desktop {
         self.sync_discovery();
         while let Ok(event) = self.events.try_recv() {
             match event {
-                Event::Status(status) => self.status = status,
+                Event::Status(status) => {
+                    self.status = status;
+                    self.tool_progress = None;
+                }
+                Event::Tool(tool) => self.tool_progress = Some(tool),
                 Event::SkillLoaded(name) => {
                     if let Some(index) = self.history.messages().len().checked_sub(1) {
                         self.loaded_skills.entry(index).or_default().insert(name);
@@ -1784,6 +1851,7 @@ impl eframe::App for Desktop {
                 Event::Finished(result) => {
                     self.busy = false;
                     self.status.clear();
+                    self.tool_progress = None;
                     match result {
                         Ok(answer) => {
                             self.history.push("assistant", answer);
@@ -1810,12 +1878,17 @@ impl Desktop {
                     .inner_margin(Margin::same(19)),
             )
             .show(context, |ui| {
-                ui.label(
-                    RichText::new(APP_NAME)
-                        .size(21.0)
-                        .strong()
-                        .color(ui.visuals().hyperlink_color),
-                );
+                ui.horizontal(|ui| {
+                    if let Some(logo) = &self.logo {
+                        ui.image((logo.id(), egui::vec2(32.0, 32.0)));
+                    }
+                    ui.label(
+                        RichText::new(APP_NAME)
+                            .size(21.0)
+                            .strong()
+                            .color(ui.visuals().hyperlink_color),
+                    );
+                });
                 ui.add_space(20.0);
                 if ui.selectable_label(!self.settings, "Chat").clicked() {
                     self.settings = false;
@@ -1931,7 +2004,9 @@ impl Desktop {
                                 }
                             }
                         }
-                        if !self.status.is_empty() {
+                        if let Some(tool) = &self.tool_progress {
+                            tool_progress_ui(ui, tool);
+                        } else if !self.status.is_empty() {
                             ui.horizontal(|ui| {
                                 if self.busy && self.approval.is_none() {
                                     ui.spinner();

@@ -1,7 +1,7 @@
 use crate::APP_NAME;
 use crate::diagnostics::Trace;
 use crate::providers::{Connection, Provider, ThinkingSetting};
-use crate::tools::{ApprovalRequest, Config, McpToolId, ToolSet};
+use crate::tools::{ApprovalRequest, Config, McpToolId, ToolActivity, ToolSet};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -14,6 +14,7 @@ const MAX_TOOL_CALLS_PER_TURN: usize = 52;
 
 pub enum Event {
     Status(String),
+    Tool(ToolProgress),
     SkillLoaded(String),
     Warning(String),
     Approve(ApprovalRequest, oneshot::Sender<ApprovalDecision>),
@@ -23,6 +24,30 @@ pub enum Event {
         tokens: Option<TokenUsage>,
     },
     Finished(Result<String>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolPhase {
+    AwaitingApproval,
+    Running,
+    AutoApproved,
+    GloballyAutoApproved,
+}
+
+pub struct ToolProgress {
+    pub activity: ToolActivity,
+    pub phase: ToolPhase,
+    pub started: Instant,
+}
+
+impl Event {
+    fn tool(activity: ToolActivity, phase: ToolPhase) -> Self {
+        Self::Tool(ToolProgress {
+            activity,
+            phase,
+            started: Instant::now(),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -264,7 +289,7 @@ pub async fn chat(
             trace.record("tool_requested", || json!({"call": tool_calls, "tool": name.chars().take(128).collect::<String>(), "arguments_id": trace.arguments_id(raw)}));
             let result = match serde_json::from_str::<Value>(raw) {
                 Ok(args) if args.is_object() && name == "find_tools" => {
-                    emit(Event::Status("Running · Find MCP tools".into()));
+                    emit(Event::tool(tools.activity(name, &args), ToolPhase::Running));
                     tools.find_tools(args, &mut newly_found)
                 }
                 Ok(args) if args.is_object() && name == "load_skill" => {
@@ -277,7 +302,7 @@ pub async fn chat(
                 }
                 Ok(args) if args.is_object() => {
                     let activity = tools.activity(name, &args);
-                    let mut running = format!("Running · {activity}");
+                    let mut phase = ToolPhase::Running;
                     if let Some(request) = tools.approval(name, &args) {
                         let approval_started = Instant::now();
                         let decision = if config.auto_approve_tools {
@@ -285,7 +310,7 @@ pub async fn chat(
                         } else {
                             let (tx, rx) = oneshot::channel();
                             trace.record("tool_approval_requested", || json!({"call": tool_calls}));
-                            emit(Event::Status(format!("Waiting for approval · {activity}")));
+                            emit(Event::tool(activity.clone(), ToolPhase::AwaitingApproval));
                             emit(Event::Approve(request, tx));
                             rx.await.unwrap_or_default()
                         };
@@ -305,17 +330,21 @@ pub async fn chat(
                             }
                             ApprovalDecision::RunOnce => {}
                             ApprovalDecision::AutoApproved => {
-                                let activity = if config.auto_approve_tools {
+                                phase = if config.auto_approve_tools {
+                                    ToolPhase::GloballyAutoApproved
+                                } else {
+                                    ToolPhase::AutoApproved
+                                };
+                                let label = if config.auto_approve_tools {
                                     format!("Global setting · {activity}")
                                 } else {
-                                    activity
+                                    activity.to_string()
                                 };
-                                running = format!("Running · Auto-approved · {activity}");
-                                auto_approved = Some(activity);
+                                auto_approved = Some(label);
                             }
                         }
                     }
-                    emit(Event::Status(running));
+                    emit(Event::tool(activity, phase));
                     tools.call(name, args).await
                 }
                 _ => Err(anyhow::anyhow!("Tool arguments must be a JSON object")),
@@ -359,10 +388,10 @@ async fn load_skill(
     trace: &Trace,
     emit: &impl Fn(Event),
 ) -> Result<String> {
-    emit(Event::Status(format!(
-        "Running · {}",
-        tools.activity("load_skill", &args)
-    )));
+    emit(Event::tool(
+        tools.activity("load_skill", &args),
+        ToolPhase::Running,
+    ));
     let name = args["name"]
         .as_str()
         .context("Expected a skill name")?

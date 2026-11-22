@@ -1,4 +1,4 @@
-use crate::agent::{self, ApprovalDecision, Event, TokenUsage, TurnSelection};
+use crate::agent::{self, ApprovalDecision, Event, TokenUsage, ToolPhase, TurnSelection};
 use crate::diagnostics::Trace;
 use crate::providers::{Provider, ThinkingSetting};
 use crate::tools::{ApprovalRule, Config, Mcp, McpToolId, ToolSet};
@@ -69,7 +69,7 @@ async fn global_auto_approval_runs_and_tracks_terminal_and_mcp_calls() -> Result
     )?;
     let (sender, entries) = std::sync::mpsc::sync_channel(64);
     let trace = Trace::new(Some(sender));
-    let statuses = std::cell::RefCell::new(Vec::new());
+    let activity = std::cell::RefCell::new(Vec::new());
     let answer = agent::chat(
         config,
         vec![("user".into(), "Run the fixture".into())],
@@ -78,17 +78,17 @@ async fn global_auto_approval_runs_and_tracks_terminal_and_mcp_calls() -> Result
         &trace,
         |event| match event {
             Event::Approve(..) => panic!("Global auto-approval must not open a confirmation"),
-            Event::Status(status) => statuses.borrow_mut().push(status),
+            Event::Tool(tool) => activity.borrow_mut().push(tool),
             _ => {}
         },
     )
     .await?;
     assert_eq!(answer, "Global approval fixture passed");
     assert_eq!(
-        statuses
+        activity
             .into_inner()
             .iter()
-            .filter(|status| status.starts_with("Running · Auto-approved · Global setting · "))
+            .filter(|tool| tool.phase == ToolPhase::GloballyAutoApproved)
             .count(),
         2
     );
@@ -138,7 +138,7 @@ async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
             None,
             &trace,
             |event| {
-                if matches!(event, Event::Status(status) if status == "Running · Find MCP tools") {
+                if matches!(event, Event::Tool(tool) if tool.activity.name == "MCP tool discovery" && tool.phase == ToolPhase::Running) {
                     calls.set(calls.get() + 1);
                 }
             },
@@ -335,7 +335,9 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
             "command": "python3",
             "args": [relative_cli, "add", "--", "Shopping", "Buy milk"]
         });
-        assert_eq!(tools.activity("terminal", &args), "python3 notes.py add");
+        let activity = tools.activity("terminal", &args);
+        assert_eq!(activity.name, "python3 notes.py");
+        assert_eq!(activity.action.as_deref(), Some("Run add"));
         assert!(tools.approval("terminal", &args).is_some());
         let output: Value = serde_json::from_str(&tools.call("terminal", args).await?)?;
         assert_eq!(output["exit_code"], 0, "{output}");
@@ -491,7 +493,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
     }
 
     let approvals = std::cell::RefCell::new(Vec::new());
-    let statuses = std::cell::RefCell::new(Vec::new());
+    let activity = std::cell::RefCell::new(Vec::new());
     let loaded_skills = std::cell::RefCell::new(Vec::new());
     let remembered = std::cell::RefCell::new(config.clone());
     let result = chat(
@@ -500,7 +502,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
         None,
         None,
         |event| match event {
-            Event::Status(status) => statuses.borrow_mut().push(status),
+            Event::Tool(tool) => activity.borrow_mut().push(tool),
             Event::SkillLoaded(name) => loaded_skills.borrow_mut().push(name),
             Event::Approve(request, reply) => {
                 let decision = if request.description.contains("should be declined") {
@@ -532,26 +534,38 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
     assert_eq!(result?, "Pluto fixture passed");
     assert_eq!(loaded_skills.into_inner(), ["notes"]);
     assert_eq!(approvals.into_inner().len(), 5);
-    let statuses = statuses.into_inner();
-    assert!(
-        statuses
-            .iter()
-            .any(|status| status == "Running · Auto-approved · printf")
-    );
-    assert!(statuses.windows(2).any(|steps| steps
-        == [
-            "Waiting for approval · local / lookup · Look up the fixture",
-            "Running · local / lookup · Look up the fixture",
-        ]));
-    assert!(
-        statuses.iter().any(
-            |status| status == "Running · Auto-approved · local / lookup · Look up the fixture"
-        )
-    );
-    assert!(
-        statuses
-            .iter()
-            .any(|status| status == "Running · remote / lookup · Look up the fixture")
-    );
+    let activity = activity.into_inner();
+    let saw = |phase, name, action| {
+        activity.iter().any(|tool| {
+            tool.phase == phase
+                && tool.activity.name == name
+                && tool.activity.action.as_deref() == Some(action)
+        })
+    };
+    assert!(saw(
+        ToolPhase::AutoApproved,
+        "printf",
+        "Run terminal command"
+    ));
+    assert!(saw(
+        ToolPhase::AwaitingApproval,
+        "local / lookup",
+        "Look up the fixture"
+    ));
+    assert!(saw(
+        ToolPhase::Running,
+        "local / lookup",
+        "Look up the fixture"
+    ));
+    assert!(saw(
+        ToolPhase::AutoApproved,
+        "local / lookup",
+        "Look up the fixture"
+    ));
+    assert!(saw(
+        ToolPhase::Running,
+        "remote / lookup",
+        "Look up the fixture"
+    ));
     Ok(())
 }
