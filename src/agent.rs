@@ -1,5 +1,5 @@
 use crate::APP_NAME;
-use crate::providers::{Connection, ThinkingSetting};
+use crate::providers::{Connection, Provider, ThinkingSetting};
 use crate::tools::{ApprovalRequest, Config, McpToolId, ToolSet};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -91,9 +91,11 @@ pub async fn chat(
         None => tools.initial_mcp_tools(),
     };
     let mut definitions = tools.definitions(&active_mcp_tools);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?;
+    let timeout = match connection.provider {
+        Provider::LlamaCpp | Provider::Ollama => Duration::from_secs(600),
+        Provider::OpenAiCompatible => Duration::from_secs(120),
+    };
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
     let selection_prompt = match &selection {
         Some(TurnSelection::Skill(_)) => "The user selected a skill for this turn. Its registered instructions are already included as a load_skill result. Use them to handle the request.".into(),
         Some(TurnSelection::Mcp(_)) => format!("The user selected MCP tool {} for this turn. Use it for the requested action.", selected_alias.as_deref().unwrap_or_default()),
