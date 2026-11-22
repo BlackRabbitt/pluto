@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -10,7 +11,28 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub type Messages = Vec<(String, String)>;
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ChatHistory {
+    messages: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    timestamps: Vec<Option<DateTime<Utc>>>,
+}
+
+impl ChatHistory {
+    pub fn push(&mut self, role: &str, content: String) {
+        self.timestamps.resize(self.messages.len(), None);
+        self.messages.push((role.into(), content));
+        self.timestamps.push(Some(Utc::now()));
+    }
+
+    pub fn messages(&self) -> &[(String, String)] {
+        &self.messages
+    }
+
+    pub fn timestamp(&self, index: usize) -> Option<DateTime<Utc>> {
+        self.timestamps.get(index).copied().flatten()
+    }
+}
 
 pub struct ChatStore {
     directory: PathBuf,
@@ -24,17 +46,13 @@ pub struct ChatEntry {
 #[derive(Serialize)]
 struct SavedChat<'a> {
     title: &'a str,
-    messages: &'a [(String, String)],
+    #[serde(flatten)]
+    history: &'a ChatHistory,
 }
 
 #[derive(Deserialize)]
 struct ChatTitle {
     title: String,
-}
-
-#[derive(Deserialize)]
-struct ChatMessages {
-    messages: Messages,
 }
 
 impl ChatStore {
@@ -136,9 +154,9 @@ impl ChatStore {
         ))
     }
 
-    pub fn read(&self, path: &Path) -> Result<Messages> {
+    pub fn read(&self, path: &Path) -> Result<ChatHistory> {
         let file = File::open(path).context("Could not open the saved chat")?;
-        let chat: ChatMessages = serde_json::from_reader(BufReader::new(file))
+        let chat: ChatHistory = serde_json::from_reader(BufReader::new(file))
             .context("Could not read the saved chat")?;
         ensure!(
             chat.messages
@@ -146,10 +164,10 @@ impl ChatStore {
                 .all(|(role, _)| matches!(role.as_str(), "user" | "assistant")),
             "Saved chat contains an invalid message role"
         );
-        Ok(chat.messages)
+        Ok(chat)
     }
 
-    pub fn save(&self, path: Option<&Path>, messages: &[(String, String)]) -> Result<ChatEntry> {
+    pub fn save(&self, path: Option<&Path>, history: &ChatHistory) -> Result<ChatEntry> {
         fs::create_dir_all(&self.directory).context("Could not create the chat history folder")?;
         let path = match path {
             Some(path) => {
@@ -161,7 +179,8 @@ impl ChatStore {
             }
             None => self.directory.join(format!("{}.json", unique_id()?)),
         };
-        let title = messages
+        let title = history
+            .messages()
             .iter()
             .find(|(role, _)| role == "user")
             .map(|(_, text)| text.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -183,7 +202,7 @@ impl ChatStore {
                 &mut file,
                 &SavedChat {
                     title: &title,
-                    messages,
+                    history,
                 },
             )?;
             file.flush()?;
@@ -225,13 +244,16 @@ mod tests {
         let store = ChatStore::beside(&config);
         assert!(store.entries()?.0.is_empty());
 
-        let mut first = vec![("user".into(), "First chat\nwith two lines".into())];
+        let mut first: ChatHistory = serde_json::from_str(
+            r#"{"title":"First chat","messages":[["user","First chat\nwith two lines"]]}"#,
+        )?;
         let first_entry = store.save(None, &first)?;
         assert_eq!(first_entry.title, "First chat with two lines");
-        let second = vec![("user".into(), "Second chat".into())];
+        let mut second = ChatHistory::default();
+        second.push("user", "Second chat".into());
         let second_entry = store.save(None, &second)?;
         assert_ne!(first_entry.path, second_entry.path);
-        first.push(("assistant".into(), "Saved reply".into()));
+        first.push("assistant", "Saved reply".into());
         let updated = store.save(Some(&first_entry.path), &first)?;
         assert_eq!(updated.path, first_entry.path);
         fs::write(store.directory.join("partial.tmp"), "{")?;
@@ -243,6 +265,9 @@ mod tests {
         assert_eq!(skipped, 1);
         assert_eq!(reopened.read(&first_entry.path)?, first);
         assert_eq!(reopened.read(&second_entry.path)?, second);
+        assert!(first.timestamp(0).is_none());
+        assert!(first.timestamp(1).is_some());
+        assert!(second.timestamp(0).is_some());
 
         let original = fs::read(&first_entry.path)?;
         let archive = reopened.archive(&first_entry.path)?;

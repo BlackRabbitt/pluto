@@ -12,7 +12,7 @@ use agent::{ApprovalDecision, Event, TokenUsage, TurnSelection};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use history::{ChatEntry, ChatStore, Messages};
+use history::{ChatEntry, ChatHistory, ChatStore};
 use providers::{Connection, ModelCapabilities, Provider, ThinkingSetting};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -127,6 +127,7 @@ fn chat_message(
     width: f32,
     role: &str,
     content: &str,
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
     markdown_cache: &mut CommonMarkCache,
 ) -> egui::Response {
     let assistant = role == "assistant";
@@ -148,11 +149,22 @@ fn chat_message(
             // Bound the inner width to the visible column before any Markdown expands it.
             let inner_width = (width - 28.0 - 2.0 * ui.visuals().window_stroke.width).max(1.0);
             ui.set_width(inner_width);
-            ui.label(
-                RichText::new(if role == "user" { "You" } else { APP_NAME })
-                    .strong()
-                    .color(ui.visuals().hyperlink_color),
-            );
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(
+                    RichText::new(if role == "user" { "You" } else { APP_NAME })
+                        .strong()
+                        .color(ui.visuals().hyperlink_color),
+                );
+                if let Some(timestamp) = timestamp {
+                    let local_time = timestamp.with_timezone(&chrono::Local);
+                    ui.label(
+                        RichText::new(local_time.format("%Y-%m-%d %H:%M").to_string())
+                            .small()
+                            .weak(),
+                    );
+                }
+            });
             if assistant {
                 // Markdown tables derive their IDs from the reply's UI scope.
                 ui.push_id(("reply", id_salt), |ui| {
@@ -186,7 +198,7 @@ mod chat_layout_tests {
         desktop.settings = false;
         desktop
             .history
-            .push(("assistant".into(), "Long reply.\n\n".repeat(80)));
+            .push("assistant", "Long reply.\n\n".repeat(80));
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 530.0));
         let render = |desktop: &mut Desktop, events| {
             context.run(
@@ -288,11 +300,9 @@ mod chat_layout_tests {
             title: "Same chat title".into(),
         });
         let markdown = "| Name | Value |\n| --- | --- |\n| Apples | 2 |\n\n```text\nExample\n```";
-        desktop.history = vec![
-            ("user".into(), "Show the results".into()),
-            ("assistant".into(), markdown.into()),
-            ("assistant".into(), markdown.into()),
-        ];
+        desktop.history.push("user", "Show the results".into());
+        desktop.history.push("assistant", markdown.into());
+        desktop.history.push("assistant", markdown.into());
         desktop.prompt = "/".into();
         desktop.picker_catalog = Lookup::Complete(Ok(PickerCatalog {
             tools: vec![McpToolId {
@@ -307,7 +317,7 @@ mod chat_layout_tests {
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(1100.0, 850.0),
+                        egui::vec2(1100.0, 1000.0),
                     )),
                     events,
                     ..Default::default()
@@ -353,6 +363,16 @@ mod chat_layout_tests {
         for expected in ["Thinking", "test-notes", "fixture / lookup"] {
             find_label(&labels, expected);
         }
+        let timestamp = desktop
+            .history
+            .timestamp(0)
+            .context("Missing message timestamp")?
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let timestamp_y = find_label(&labels, timestamp.as_str()).y;
+        assert!(find_label(&labels, "You").y < timestamp_y);
+        assert!(timestamp_y < find_label(&labels, "Show the results").y);
         assert_eq!(
             labels.iter().filter(|(label, _)| label == "Apples").count(),
             2
@@ -418,7 +438,8 @@ mod chat_layout_tests {
                     egui::CentralPanel::default().show(context, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             let width = ui.available_width();
-                            let reply = chat_message(ui, 0, width, "assistant", &table, &mut cache);
+                            let reply =
+                                chat_message(ui, 0, width, "assistant", &table, None, &mut cache);
                             assert!(reply.rect.width() <= width + 1.0);
                             chat_message(
                                 ui,
@@ -426,6 +447,7 @@ mod chat_layout_tests {
                                 width,
                                 "assistant",
                                 "| Item | Count |\n| --- | --- |\n| Apples | 2 |",
+                                None,
                                 &mut cache,
                             );
                         });
@@ -495,13 +517,13 @@ mod chat_layout_tests {
                         let paragraph = format!("{} 🫨", "Long replies should wrap. ".repeat(20));
                         let code = format!("```text\n{}\n```", "x".repeat(180));
                         let table = "| A | B | C | D |\n| --- | --- | --- | --- |\n| Wide content | Wide content | Wide content | Wide content |";
-                        let reply = chat_message(ui, 0, width, "assistant", &paragraph, &mut cache);
+                        let reply = chat_message(ui, 0, width, "assistant", &paragraph, None, &mut cache);
                         assert!(reply.rect.height() > 100.0);
                         assert!(reply.rect.width() <= width + 1.0);
-                        let reply = chat_message(ui, 1, width, "assistant", &code, &mut cache);
+                        let reply = chat_message(ui, 1, width, "assistant", &code, None, &mut cache);
                         assert!(reply.rect.height() > 80.0);
                         assert!(reply.rect.width() <= width + 1.0);
-                        let reply = chat_message(ui, 2, width, "assistant", table, &mut cache);
+                        let reply = chat_message(ui, 2, width, "assistant", table, None, &mut cache);
                         assert!(reply.rect.width() <= width + 1.0);
                         assert!(ui.fonts(|fonts| fonts.has_glyph(&egui::FontId::proportional(17.0), '🫨')));
                     });
@@ -593,7 +615,7 @@ struct Desktop {
     capabilities: Lookup<ModelCapabilities>,
     thinking_setting: Option<ThinkingSetting>,
     context_usage: Option<TokenUsage>,
-    history: Messages,
+    history: ChatHistory,
     markdown_cache: CommonMarkCache,
     chat_store: Option<ChatStore>,
     saved_chats: Vec<ChatEntry>,
@@ -695,7 +717,7 @@ impl Desktop {
         }
         let (active_chat, history) = match restored {
             Some((path, messages)) => (Some(path), messages),
-            None => (None, Vec::new()),
+            None => (None, ChatHistory::default()),
         };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -760,12 +782,11 @@ impl Desktop {
         };
         self.connection_errors.clear();
         self.busy = true;
-        self.history
-            .push(("user".into(), std::mem::take(&mut self.prompt)));
+        self.history.push("user", std::mem::take(&mut self.prompt));
         self.chat_dirty = true;
         self.persist_chat();
         let config = self.config.clone();
-        let history = self.history.clone();
+        let history = self.history.messages().to_vec();
         let thinking = self.thinking_setting.clone();
         let sender = self.sender.clone();
         let trace = diagnostics::Trace::new(self.diagnostics.clone());
@@ -1012,7 +1033,7 @@ impl Desktop {
                 }
             }
         } else {
-            Vec::new()
+            ChatHistory::default()
         };
         self.active_chat = path;
         self.selection = None;
@@ -1729,7 +1750,7 @@ impl eframe::App for Desktop {
             match event {
                 Event::Status(status) => self.status = status,
                 Event::SkillLoaded(name) => {
-                    if let Some(index) = self.history.len().checked_sub(1) {
+                    if let Some(index) = self.history.messages().len().checked_sub(1) {
                         self.loaded_skills.entry(index).or_default().insert(name);
                     }
                 }
@@ -1765,7 +1786,7 @@ impl eframe::App for Desktop {
                     self.status.clear();
                     match result {
                         Ok(answer) => {
-                            self.history.push(("assistant".into(), answer));
+                            self.history.push("assistant", answer);
                             self.chat_dirty = true;
                             self.persist_chat();
                         }
@@ -1882,18 +1903,19 @@ impl Desktop {
                         for warning in &self.connection_errors {
                             ui.label(RichText::new(warning).color(ui.visuals().warn_fg_color));
                         }
-                        if self.history.is_empty() {
+                        if self.history.messages().is_empty() {
                             ui.add_space(52.0);
                             ui.label(RichText::new("What would you like to do?").size(25.0));
                         }
                         let column_width = ui.available_width().min(ui.clip_rect().width());
-                        for (index, (role, content)) in self.history.iter().enumerate() {
+                        for (index, (role, content)) in self.history.messages().iter().enumerate() {
                             chat_message(
                                 ui,
                                 (&self.active_chat, index),
                                 column_width,
                                 role,
                                 content,
+                                self.history.timestamp(index),
                                 &mut self.markdown_cache,
                             );
                             if let Some(skills) = self.loaded_skills.get(&index) {
