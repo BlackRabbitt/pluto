@@ -1,6 +1,7 @@
 """An MCP server and scripted model for the end-to-end cargo test."""
 import json
 import sys
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -60,6 +61,14 @@ def tool_discovery_model(request):
 
 
 def model(request):
+    system_prompt = request["messages"][0]["content"]
+    clock_lines = [line for line in system_prompt.splitlines() if line.startswith("Current local date and time: ")]
+    assert len(clock_lines) == 1
+    local_time = datetime.fromisoformat(clock_lines[0].removeprefix("Current local date and time: "))
+    assert local_time.utcoffset() is not None
+    assert abs((datetime.now(timezone.utc) - local_time).total_seconds()) < 60
+    assert any(line.startswith("Local time zone: ") and line.removeprefix("Local time zone: ").strip()
+               for line in system_prompt.splitlines())
     if request["model"] == "global-approval-fixture":
         results = [item["content"] for item in request["messages"] if item["role"] == "tool"]
         if not results:

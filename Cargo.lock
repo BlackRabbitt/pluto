@@ -2119,6 +2119,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui_commonmark",
+ "iana-time-zone",
  "reqwest",
  "rmcp",
  "serde",
