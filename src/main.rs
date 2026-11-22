@@ -24,6 +24,8 @@ use tokio::sync::oneshot;
 use tools::{ApprovalRequest, ApprovalRule, Config, Mcp, McpToolId, ToolSet};
 
 const APP_NAME: &str = "Pluto";
+const CHAT_DRAFT_HEIGHT: f32 = 80.0;
+const CHAT_PICKER_HEIGHT: f32 = 155.0;
 
 fn configure_fonts(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -173,6 +175,78 @@ fn chat_message(
 #[cfg(test)]
 mod chat_layout_tests {
     use super::*;
+
+    #[test]
+    fn long_chat_and_draft_leave_composer_visible() -> Result<()> {
+        let context = egui::Context::default();
+        configure_fonts(&context);
+        configure_theme(&context);
+        let mut desktop = Desktop::with_config(Config::default(), String::new(), None, None)?;
+        desktop.settings = false;
+        desktop
+            .history
+            .push(("assistant".into(), "Long reply.\n\n".repeat(80)));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 530.0));
+        let render = |desktop: &mut Desktop, events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |context| desktop.show_ui(context),
+            )
+        };
+        let visible_text = |output: &egui::FullOutput, matches: fn(&str) -> bool, fully_visible| {
+            output.shapes.iter().find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                    let clip = shape.clip_rect.intersect(screen);
+                    let visible = matches(text.galley.text())
+                        && if fully_visible {
+                            clip.contains_rect(bounds)
+                        } else {
+                            clip.intersects(bounds)
+                        };
+                    visible.then_some(bounds.center())
+                } else {
+                    None
+                }
+            })
+        };
+        let initial = render(&mut desktop, Vec::new());
+        let send_position = visible_text(&initial, |text| text == "Send", true)
+            .context("Send must be visible before entering a draft")?;
+        for draft in ["Draft line\n".repeat(80), "Draft line ".repeat(240)] {
+            desktop.prompt = draft;
+            let output = render(&mut desktop, Vec::new());
+            assert_eq!(
+                visible_text(&output, |text| text == "Send", true),
+                Some(send_position)
+            );
+            assert!(visible_text(&output, |text| text.starts_with("Draft line"), false).is_some());
+        }
+
+        let button = |pressed| egui::Event::PointerButton {
+            pos: send_position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(
+            &mut desktop,
+            vec![
+                egui::Event::PointerMoved(send_position),
+                button(true),
+                button(false),
+            ],
+        );
+        assert!(
+            desktop.settings,
+            "Clicking Send should open setup when no model is configured"
+        );
+        Ok(())
+    }
 
     #[test]
     fn chat_controls_can_share_a_frame_without_widget_id_collisions() -> Result<()> {
@@ -759,7 +833,7 @@ impl Desktop {
         };
         egui::ScrollArea::vertical()
             .id_salt("composer_picker")
-            .max_height(155.0)
+            .max_height(CHAT_PICKER_HEIGHT)
             .show(ui, |ui| {
                 let mut current_group = "";
                 for (index, choice) in choices.iter().enumerate() {
@@ -847,14 +921,21 @@ impl Desktop {
         if cancel {
             self.prompt.clear();
         }
-        let input = ui.add_enabled(
-            !self.busy,
-            TextEdit::multiline(&mut self.prompt)
-                .id(input_id)
-                .hint_text("Message Pluto or type / to pick a tool")
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
+        let input = egui::ScrollArea::vertical()
+            .id_salt("composer_draft")
+            .max_height(CHAT_DRAFT_HEIGHT)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_enabled(
+                    !self.busy,
+                    TextEdit::multiline(&mut self.prompt)
+                        .id(input_id)
+                        .hint_text("Message Pluto or type / to pick a tool")
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                )
+            })
+            .inner;
         if input.changed() {
             self.picker_index = 0;
         }
@@ -1737,20 +1818,35 @@ impl Desktop {
                         self.persist_chat();
                     }
                 }
-                let composer_space = if self.active_chat_is_archived() {
-                    40.0
-                } else if self.picker_query().is_some() {
-                    245.0
-                } else if self.selection.is_some() {
-                    138.0
+                let spacing = ui.spacing().item_spacing.y;
+                let row = ui.spacing().interact_size.y;
+                let composer_height = if self.active_chat_is_archived() {
+                    row + spacing
                 } else {
-                    100.0
+                    let actions = if self.picker_query().is_some() {
+                        CHAT_PICKER_HEIGHT
+                    } else {
+                        row
+                    };
+                    let selection = if self.selection.is_some() {
+                        row + spacing
+                    } else {
+                        0.0
+                    };
+                    selection + CHAT_DRAFT_HEIGHT + actions + 2.0 * spacing
                 };
-                let message_area = (ui.available_height() - composer_space).max(40.0);
+                egui::TopBottomPanel::bottom("chat_composer_panel")
+                    .exact_height(composer_height)
+                    .show_separator_line(false)
+                    .frame(Frame::new().inner_margin(Margin {
+                        top: spacing as i8,
+                        ..Margin::ZERO
+                    }))
+                    .show_inside(ui, |ui| self.composer_ui(ui));
                 egui::ScrollArea::vertical()
                     .id_salt(&self.active_chat)
                     .stick_to_bottom(true)
-                    .max_height(message_area)
+                    .min_scrolled_height(0.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for warning in &self.connection_errors {
@@ -1800,7 +1896,6 @@ impl Desktop {
                             });
                         }
                     });
-                self.composer_ui(ui);
             });
         self.approval_ui(context);
     }
