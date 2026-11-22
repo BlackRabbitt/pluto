@@ -1,24 +1,37 @@
 # Pluto
 
-A Rust desktop chatbot for a local or remote tool-capable model. The model can read installed skills, run commands found on the system PATH, and use local or remote MCP tools. Chats are saved locally.
+<img src="assets/pluto-icon.png" alt="Pluto Evergreen icon" width="112" height="112">
 
-## Run
+Pluto is a lightweight Rust desktop chatbot for local and remote models. It can load skills, run terminal commands, and call MCP tools. Chats are saved as local JSON files.
 
-Pluto is built and tested with **Rust 1.100.0**. Install that version and start a tool-capable model server. Then run from this directory.
+## Run Pluto
+
+Use **Rust 1.100.0** and a model that supports tool calls. From the Pluto folder, run:
 
 ```sh
 cargo run --locked
 ```
 
-In **Settings**, select **llama.cpp**, **Ollama**, or **OpenAI-compatible**. Enter your server URL, click **Load models**, and select a model. You can also enter its name directly. For llama.cpp and Ollama, use the server base URL. For other servers, use their OpenAI-compatible base URL, including any required path such as `/v1`. If the server requires authentication, enter the name of the environment variable containing its token.
+On Linux, Pluto needs a graphical desktop and working OpenGL drivers. On macOS, launch it from a terminal if Pluto needs your shell’s API keys or access to CLI commands on your PATH.
 
-Set the working directory for terminal commands, save settings, and switch to **Chat**. The **Thinking** menu shows the selected model’s supported levels or an **On/Off** switch when the model offers only a toggle. **Server default** uses the server’s own behavior. The selection applies to subsequent messages with that model.
+### Connect a model
 
-On Linux, the app needs a graphical desktop and working OpenGL drivers. On macOS, launch it from a terminal if your CLI or model credentials depend on your shell environment.
+1. Open **Settings** and pick a provider.
+2. Enter the server URL and any required token environment variable. Then click **Load models** and pick a model, or enter its model ID directly.
+3. Set **Terminal working directory** if you plan to run commands. Click **Save settings** and open **Chat**.
+
+| Provider | Server URL |
+| --- | --- |
+| **llama.cpp** | The server base URL, for example `http://localhost:8080` |
+| **Ollama** | The server base URL, for example `http://localhost:11434` |
+| **OpenAI-compatible** | The provider’s API base URL, including its required path such as `/v1` |
+| **Google AI Studio** | Pick **OpenAI-compatible** and use `https://generativelanguage.googleapis.com/v1beta/openai/`. [Google’s setup guide](https://ai.google.dev/gemini-api/docs/openai) |
+
+For an authenticated model or MCP server, export the key before launching Pluto. In Settings, enter the **variable name**, such as `GEMINI_API_KEY`. If Pluto can load the model list but chat returns a 404, check that your model ID supports text chat on that endpoint.
 
 ### Use Rust 1.100.0 only for Pluto
 
-With Rustup installed, run these commands from the Pluto folder.
+Run these commands from the Pluto folder with Rustup installed:
 
 ```sh
 rustup toolchain install 1.100.0
@@ -26,78 +39,88 @@ rustup override set 1.100.0
 rustc --version
 ```
 
-`rustc --version` should report `rustc 1.100.0`. The override applies to this folder and its subfolders. To remove it, run `rustup override unset` from the Pluto folder.
+`rustc --version` should report `rustc 1.100.0`. This override applies to the folder and its subfolders. Run `rustup override unset` there to remove it.
 
-To share the pin with everyone who clones the repository, create and commit a `rust-toolchain.toml` file at the project root with these contents.
+To share the pin with everyone who clones a project, commit a `rust-toolchain.toml` at the project root:
 
 ```toml
 [toolchain]
 channel = "1.100.0"
 ```
 
-## Chat history
+## Chat
 
-Open a saved conversation from **Recent chats** in the sidebar or select **New chat** to start another one. The app reopens the most recently updated chat on launch. Sent messages and completed replies are saved as plain JSON in a `chats` folder beside `tools.toml`.
+- Use the **Thinking** menu to select a level or toggle when llama.cpp or Ollama reports support. **Server default** uses the server’s own behavior. The choice applies to subsequent messages with that model.
+- Chat shows token usage when the model reports it. For llama.cpp, it also shows the context window reported by the server. Change the llama.cpp context size when launching the server.
+- Pluto sends the full transcript of the open chat and the computer’s local date, time, and time zone to the configured model. New messages show a timestamp below the sender name.
+- Reopen conversations under **Recent chats**. Pluto opens the most recently updated chat on launch. Use **Archive chat** to move a conversation out of the recent list, and **Restore chat** to continue it.
 
-Open a saved conversation and click **Archive chat** to move its file into `chats/archive`. Open it under **Archived chats** to read it, or click **Restore chat** to move it back and continue the conversation.
+## Use skills and tools
 
-### Debug a tool-heavy turn
+Type `/` at the start of the message box to pick a skill or MCP tool. Filter by typing, then click a result or use **↑**, **↓**, and **Enter**. Type your request and send it. The selection applies to that message.
 
-Pluto writes `agent-debug.jsonl` beside `tools.toml` in the background. Group lines by `process` and `turn` to follow model requests, MCP discovery, tool calls, approvals, timings, and the tool limit. Calls with identical argument text share an `arguments_id` within a turn. The log records metadata and names. Prompts, raw arguments, credentials, and tool output are omitted. Pluto keeps the current log and one previous log, up to 2 MiB each.
+### Add or update a skill
 
-If a batch would exceed 52 tool calls, Pluto skips that batch and asks the model for a partial answer using the results already gathered. The final request runs with tools disabled.
+1. Install the skill’s CLI separately and make sure Pluto can find it on your PATH.
+2. In **Settings → Skills**, enter the full path to a local skill directory or its `SKILL.md`. Choose **Add skill**, then **Save settings**. For GitHub skills, check out the files locally first.
+3. Ask Pluto for something the skill can do. When the skill loads, Chat shows its name. Terminal commands run noninteractively from the configured working directory with your account’s privileges.
 
-## Add a skill and use a CLI
-
-1. Install the app's CLI independently and make sure the command is on the PATH inherited by Pluto.
-2. In **Settings → Skills**, enter the local skill directory or its `SKILL.md`. Select **Add skill** and save.
-3. Ask the assistant to do something described by the skill. Pluto shows the executable and arguments before running it, then returns the exit code, stdout, and stderr to the model.
-
-Pluto registers a path to the skill and reads its instructions when requested. Keep the skill folder available. For a skill from a repository, check it out locally and register that folder. The terminal tool runs an executable with separate arguments in the configured working directory. It is noninteractive and runs with your account's privileges. An explicit shell command can be approved if you need pipes or redirects.
-
-Type `/` at the start of the Chat box to pick a registered skill or an MCP tool. Type to filter, then click a result or use **↑**, **↓**, and **Enter**. Type your request and send it. The selection applies to that message, and tool calls follow the usual approval rules.
-
-For repeat CLI calls, choose **Run always** to save approval for the exact command in that working directory. For commands that use `--` after their fixed arguments, you can also allow the values after `--` to vary while keeping their count fixed. Matching calls show **Auto-approved** in Chat. You can remove a rule under **Settings → Saved approvals**.
-
-**Settings → Tool approvals → Auto-approve tool calls (at your own risk)** is off by default. Enable it and click **Save settings** to let new messages run terminal commands and MCP tools without confirmation. Those calls show **Auto-approved · Global setting** in Chat and are tracked in `agent-debug.jsonl`. Turn the setting off and save to return to individual approvals and saved rules.
-
-### Update a skill
+Pluto passes arguments directly to the executable. Pipes and redirects require an explicit shell command. The model receives the exit code and captured output.
 
 | What changed | What to do |
 | --- | --- |
-| Instructions in `SKILL.md` | Save the file in place. Pluto reads the updated instructions the next time the model loads the skill, even in the same chat. |
-| Skill description | In **Settings → Skills**, add the same file again and click **Save settings**. This refreshes the description the model sees when choosing a skill. |
-| Skill name or file location | Remove the old entry in **Settings → Skills**, add the updated file, and click **Save settings**. |
-| Skill files in a GitHub repository | Update your local copy first. Then follow the row above for what changed. |
+| Instructions in `SKILL.md` | Save the file in place. Pluto reads it the next time it loads the skill, even in the same chat. |
+| Description | Add the same file again and click **Save settings** to refresh what the model sees in the skill catalog. |
+| Name or path | Remove the old entry, add the updated one, and save. |
+| Files in a GitHub repo | Update your local copy, then follow the row for what changed. |
 
-To try an update right away, ask Pluto to use the skill by name in your next message.
-
-### Try the test notes app
-
-With Python 3 installed, run these commands from the project root:
+To try the test notes skill, install Python 3, set the terminal working directory to the Pluto folder, and register [tests/test-notes/SKILL.md](tests/test-notes/SKILL.md). Save settings and ask “Create a test note titled Shopping with the body Buy milk.” To try the CLI directly:
 
 ```sh
 python3 tests/test-notes/notes.py add -- "Shopping" "Buy milk"
 python3 tests/test-notes/notes.py search -- "milk"
 ```
 
-To try it in Chat, set **Terminal working directory** to the project root. Register [tests/test-notes/SKILL.md](tests/test-notes/SKILL.md) using its full local path, save settings, and ask “Create a test note titled Shopping with the body Buy milk.” The CLI stores sample data in `tests/test-notes/.notes.sqlite3`.
+The CLI uses `tests/test-notes/.notes.sqlite3` for sample data.
 
-## Add an MCP server
+### Add an MCP server
 
-In **Settings → MCP servers**, select a transport and enter the server details.
+In **Settings → MCP servers**, select a transport:
 
-- **Local process** uses stdio. Enter the launch command and one argument per line. The command must be installed separately.
-- **Remote HTTP** uses Streamable HTTP. Enter the MCP endpoint URL and, when required, the name of an environment variable holding its bearer token. Set the variable before launching the app.
+- **Local process (stdio)**. Enter the installed command and one argument per line.
+- **Remote HTTP (Streamable HTTP)**. Enter the MCP endpoint and the bearer token variable name if the server requires it.
 
-Use **Test connection** to check the form, or **Test** next to an existing entry. Pluto connects and lists the tools it finds. Select **Add MCP server**, then **Save settings** to keep the entry. When you send a message, Chat discovers each server's tools and asks for approval before calling a tool. Install or authorize the server using its own instructions.
+Click **Test connection** to see which tools the server exposes. Click **Add MCP server**, then **Save settings**. To recheck an existing server, click **Test** next to it.
 
-Choose **Run always** to approve future calls to that specific tool on the same server configuration, including calls with different arguments. Matching calls show **Auto-approved** in Chat. Use **Settings → Saved approvals** to forget an approval.
+Small catalogs are available directly. For larger catalogs, Pluto lets the model use `find_tools` to load the best match as needed. The search can target a specific server.
 
-When the MCP catalog is large, Pluto gives the model a `find_tools` tool to search names and descriptions. Each search loads the best match for the current turn and can be limited to a server by its name in Settings. The model can search again for a follow-up tool. The usual approval rules apply. Small catalogs are available directly.
+For Slack, register a local MCP server that handles its own credentials, or supply a bearer token obtained through Slack’s OAuth setup for its hosted endpoint. Pluto expects the credentials to be ready before connecting. [Slack MCP setup](https://docs.slack.dev/ai/slack-mcp-server/)
 
-For Slack, register a configured Slack MCP server using either transport. Slack's [official hosted endpoint](https://docs.slack.dev/ai/slack-mcp-server/) requires a registered Slack app and OAuth. This build accepts a caller-supplied bearer token for compatible HTTP servers. It does not run the Slack authorization flow or refresh credentials. A Slack MCP server that handles its own credentials can be registered as a local process.
+For web search, connect a web-search MCP server using the same steps.
 
-A web-search MCP server can be registered in the same way. There is no separate built-in browser or web-search implementation.
+### Approvals and live activity
 
-The configuration is stored as `pluto/tools.toml` inside the OS user config directory. You can edit it by hand while the app is closed or set `PLUTO_CONFIG` to load a different file. On first launch, Pluto moves the previous default settings and chats if the new data folder does not already exist.
+By default, Pluto asks before running a terminal command or calling an MCP tool. Chat shows the tool name, action, elapsed time, and approval status below your latest message.
+
+| Approval | What it allows |
+| --- | --- |
+| **Run once** | Approves the current call. |
+| **Run always** for a terminal command | Approves the same command and arguments in the same working directory. For commands using `--` to separate fixed arguments from operands, you can optionally let those operand values vary while keeping their count fixed. |
+| **Run always** for MCP | Approves future calls to that tool on the same server configuration, including calls with different arguments. |
+| **Auto-approve tool calls (at your own risk)** | Allows terminal and MCP calls without prompting. It is off by default and takes effect for new messages after **Save settings**. |
+
+Manage these options under **Settings → Tool approvals**. Use **Saved approvals** to forget individual rules. Automatic approvals appear as **Auto-approved** in Chat and in the debug log.
+
+## Local files and troubleshooting
+
+| File or folder | Contents |
+| --- | --- |
+| `tools.toml` | Model, workspace, registered skills and MCP servers, and approval settings |
+| `chats/` and `chats/archive/` | Recent and archived chat transcripts |
+| `agent-debug.jsonl` | Background diagnostics for model requests, tool calls, approvals, timings, and outcomes |
+
+These live together under `~/Library/Application Support/pluto/` on macOS, or under `pluto/` in the OS user config directory. Set `PLUTO_CONFIG` to choose a different settings file. Chats and logs sit beside it. On first launch, Pluto moves the previous default data folder if the new one does not yet exist.
+
+If a batch would exceed **52 tool calls** in a message, Pluto skips that batch and asks for a partial answer using the results already gathered. In the log, group entries by `process` and `turn`. Identical argument text shares an `arguments_id` within a turn. The log includes metadata and names and omits prompts, raw arguments, credentials, and tool output. Pluto keeps the current and previous log, up to 2 MiB each.
+
+For code changes, see the [development guide](DEVELOPMENT.md).
