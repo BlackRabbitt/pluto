@@ -60,6 +60,14 @@ def tool_discovery_model(request):
 
 
 def model(request):
+    if request["model"] in ("tool-limit-fixture", "tool-limit-overflow-fixture"):
+        count = sum(item["role"] == "tool" for item in request["messages"])
+        if count == 52 and request["model"] == "tool-limit-fixture":
+            return {"choices": [{"message": {"content": "52 tool calls completed"}}]}
+        reply = tool_call(count, "find_tools", {"query": "fixture"})
+        second = tool_call(count + 1, "find_tools", {"query": "fixture"})
+        reply["choices"][0]["message"]["tool_calls"].extend(second["choices"][0]["message"]["tool_calls"])
+        return reply
     if request["model"] == "picked-mcp-fixture":
         names = [tool["function"]["name"] for tool in request["tools"]]
         visible = [name for name in names if name.startswith("mcp_")]

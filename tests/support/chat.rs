@@ -31,6 +31,46 @@ async fn http_fixture(script: &Path) -> Result<(Child, u16)> {
 }
 
 #[tokio::test]
+async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
+    let (_http, port) = http_fixture(&script).await?;
+    for overflow in [false, true] {
+        let config = Config {
+            model_provider: Some(Provider::OpenAiCompatible),
+            model_url: format!("http://127.0.0.1:{port}/v1"),
+            model_name: if overflow {
+                "tool-limit-overflow-fixture"
+            } else {
+                "tool-limit-fixture"
+            }
+            .into(),
+            ..Config::default()
+        };
+        let calls = std::cell::Cell::new(0);
+        let result = chat(
+            config,
+            vec![("user".into(), "Run the fixture".into())],
+            None,
+            None,
+            |event| {
+                if matches!(event, Event::Status(status) if status == "Running · Find MCP tools") {
+                    calls.set(calls.get() + 1);
+                }
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 52);
+        if overflow {
+            let error = result.expect_err("Expected the tool-call limit to stop the next batch");
+            assert!(error.to_string().contains("52 tool calls"));
+        } else {
+            assert_eq!(result?, "52 tool calls completed");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn provider_metadata_controls_chat_reasoning() -> Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;

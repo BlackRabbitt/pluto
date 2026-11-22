@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use std::{collections::BTreeSet, time::Duration};
 use tokio::sync::oneshot;
 
+const MAX_TOOL_CALLS_PER_TURN: usize = 52;
+
 pub enum Event {
     Status(String),
     SkillLoaded(String),
@@ -129,12 +131,13 @@ pub async fn chat(
     }
 
     let mut auto_approved = None;
-    for step in 0..12 {
+    let mut tool_calls = 0;
+    loop {
         let status = match auto_approved.take() {
             Some(activity) => {
                 format!("{APP_NAME} is reviewing the tool results… · Auto-approved · {activity}")
             }
-            None if step == 0 => format!("{APP_NAME} is preparing a reply…"),
+            None if tool_calls == 0 => format!("{APP_NAME} is preparing a reply…"),
             None => format!("{APP_NAME} is reviewing the tool results…"),
         };
         emit(Event::Status(status));
@@ -167,6 +170,11 @@ pub async fn chat(
                 .context("The model returned neither text nor a tool call");
         };
         ensure!(calls.len() <= 16, "Model requested too many tools at once");
+        ensure!(
+            calls.len() <= MAX_TOOL_CALLS_PER_TURN - tool_calls,
+            "Reached the limit of {MAX_TOOL_CALLS_PER_TURN} tool calls for this message"
+        );
+        tool_calls += calls.len();
         messages
             .push(json!({"role":"assistant", "content":message["content"], "tool_calls":calls}));
 
@@ -224,7 +232,6 @@ pub async fn chat(
             definitions = tools.definitions(&active_mcp_tools);
         }
     }
-    anyhow::bail!("Stopped after 12 model steps")
 }
 
 async fn load_skill(tools: &ToolSet<'_>, args: Value, emit: &impl Fn(Event)) -> Result<String> {
