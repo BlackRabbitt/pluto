@@ -33,6 +33,7 @@ pub struct Config {
     pub model_name: String,
     pub model_token_env: String,
     pub workspace: PathBuf,
+    pub auto_approve_tools: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub terminal_approvals: Vec<TerminalApproval>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -162,6 +163,7 @@ impl Default for Config {
             model_name: String::new(),
             model_token_env: String::new(),
             workspace: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            auto_approve_tools: false,
             terminal_approvals: Vec::new(),
             mcp_approvals: Vec::new(),
             skills: BTreeMap::new(),
@@ -865,6 +867,22 @@ async fn run_process(workspace: &Path, executable: &str, args: &[String]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_auto_approval_defaults_off_and_round_trips() -> Result<()> {
+        assert!(!toml::from_str::<Config>("")?.auto_approve_tools);
+        for enabled in [true, false] {
+            let config = Config {
+                auto_approve_tools: enabled,
+                ..Config::default()
+            };
+            assert_eq!(
+                toml::from_str::<Config>(&toml::to_string(&config)?)?.auto_approve_tools,
+                enabled
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn mcp_changes_require_an_explicit_save() -> Result<()> {

@@ -612,6 +612,7 @@ struct Desktop {
     notice: String,
     connection_errors: Vec<String>,
     config_error: bool,
+    auto_approve_tools_draft: bool,
     approval: Option<PendingApproval>,
     workspace: String,
     skill_path: String,
@@ -701,6 +702,7 @@ impl Desktop {
             settings: config.model_name.trim().is_empty() || config.model_connection().is_err(),
             workspace: config.workspace.display().to_string(),
             config_error: !notice.is_empty(),
+            auto_approve_tools_draft: config.auto_approve_tools,
             config,
             discovery_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -1107,6 +1109,7 @@ impl Desktop {
         }
         let result = (|| -> anyhow::Result<()> {
             let mut saved = self.config.clone();
+            saved.auto_approve_tools = self.auto_approve_tools_draft;
             let workspace = self.workspace.trim();
             if !workspace.is_empty() {
                 let path = Path::new(workspace);
@@ -1558,6 +1561,15 @@ impl Desktop {
             "Terminal working directory",
             &mut self.workspace,
             "/path/to/workspace",
+        );
+        ui.separator();
+        ui.heading("Tool approvals");
+        ui.checkbox(
+            &mut self.auto_approve_tools_draft,
+            "Auto-approve tool calls (at your own risk)",
+        )
+        .on_hover_text(
+            "After saving, new messages can run terminal commands and MCP tools without asking.",
         );
         self.saved_approvals_ui(ui);
         ui.separator();

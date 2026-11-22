@@ -60,6 +60,17 @@ def tool_discovery_model(request):
 
 
 def model(request):
+    if request["model"] == "global-approval-fixture":
+        results = [item["content"] for item in request["messages"] if item["role"] == "tool"]
+        if not results:
+            return tool_call(0, "terminal", {"command": "printf", "args": ["%s", "global approval"]})
+        assert json.loads(results[0])["stdout"] == "global approval"
+        if len(results) == 1:
+            lookup = next(tool["function"]["name"] for tool in request["tools"]
+                          if tool["function"]["name"].endswith("_fixture_lookup"))
+            return tool_call(1, lookup, {})
+        assert len(results) == 2 and "fixture lookup succeeded" in results[1]
+        return {"choices": [{"message": {"content": "Global approval fixture passed"}}]}
     if request["model"].startswith("tool-limit-"):
         count = sum(item["role"] == "tool" for item in request["messages"])
         if "tools" not in request:

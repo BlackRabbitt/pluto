@@ -50,6 +50,64 @@ async fn http_fixture(script: &Path) -> Result<(Child, u16)> {
 }
 
 #[tokio::test]
+async fn global_auto_approval_runs_and_tracks_terminal_and_mcp_calls() -> Result<()> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
+    let (_http, port) = http_fixture(&script).await?;
+    let mut config = Config {
+        model_provider: Some(Provider::OpenAiCompatible),
+        model_url: format!("http://127.0.0.1:{port}/v1"),
+        model_name: "global-approval-fixture".into(),
+        auto_approve_tools: true,
+        ..Config::default()
+    };
+    config.set_mcp_server(
+        "fixture",
+        Some(Mcp::Http {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            token_env: String::new(),
+        }),
+    )?;
+    let (sender, entries) = std::sync::mpsc::sync_channel(64);
+    let trace = Trace::new(Some(sender));
+    let statuses = std::cell::RefCell::new(Vec::new());
+    let answer = agent::chat(
+        config,
+        vec![("user".into(), "Run the fixture".into())],
+        None,
+        None,
+        &trace,
+        |event| match event {
+            Event::Approve(..) => panic!("Global auto-approval must not open a confirmation"),
+            Event::Status(status) => statuses.borrow_mut().push(status),
+            _ => {}
+        },
+    )
+    .await?;
+    assert_eq!(answer, "Global approval fixture passed");
+    assert_eq!(
+        statuses
+            .into_inner()
+            .iter()
+            .filter(|status| status.starts_with("Running · Auto-approved · Global setting · "))
+            .count(),
+        2
+    );
+    let entries: Vec<Value> = entries
+        .try_iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["event"] == "tool_approval_decided"
+                && entry["details"]["source"] == "global_setting")
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;

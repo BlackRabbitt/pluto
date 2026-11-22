@@ -279,16 +279,24 @@ pub async fn chat(
                     let activity = tools.activity(name, &args);
                     let mut running = format!("Running · {activity}");
                     if let Some(request) = tools.approval(name, &args) {
-                        let (tx, rx) = oneshot::channel();
                         let approval_started = Instant::now();
-                        trace.record("tool_approval_requested", || json!({"call": tool_calls}));
-                        emit(Event::Status(format!("Waiting for approval · {activity}")));
-                        emit(Event::Approve(request, tx));
-                        let decision = rx.await.unwrap_or_default();
+                        let decision = if config.auto_approve_tools {
+                            ApprovalDecision::AutoApproved
+                        } else {
+                            let (tx, rx) = oneshot::channel();
+                            trace.record("tool_approval_requested", || json!({"call": tool_calls}));
+                            emit(Event::Status(format!("Waiting for approval · {activity}")));
+                            emit(Event::Approve(request, tx));
+                            rx.await.unwrap_or_default()
+                        };
                         trace.record("tool_approval_decided", || json!({"call": tool_calls, "duration_ms": approval_started.elapsed().as_millis(), "decision": match &decision {
                             ApprovalDecision::Decline => "declined",
                             ApprovalDecision::RunOnce => "run_once",
                             ApprovalDecision::AutoApproved => "auto_approved",
+                        }, "source": match &decision {
+                            ApprovalDecision::AutoApproved if config.auto_approve_tools => "global_setting",
+                            ApprovalDecision::AutoApproved => "saved_rule",
+                            _ => "prompt",
                         }}));
                         match decision {
                             ApprovalDecision::Decline => {
@@ -297,6 +305,11 @@ pub async fn chat(
                             }
                             ApprovalDecision::RunOnce => {}
                             ApprovalDecision::AutoApproved => {
+                                let activity = if config.auto_approve_tools {
+                                    format!("Global setting · {activity}")
+                                } else {
+                                    activity
+                                };
                                 running = format!("Running · Auto-approved · {activity}");
                                 auto_approved = Some(activity);
                             }

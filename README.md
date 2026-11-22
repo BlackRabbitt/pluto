@@ -59,6 +59,8 @@ Type `/` at the start of the Chat box to pick a registered skill or an MCP tool.
 
 For repeat CLI calls, choose **Run always** to save approval for the exact command in that working directory. For commands that use `--` after their fixed arguments, you can also allow the values after `--` to vary while keeping their count fixed. Matching calls show **Auto-approved** in Chat. You can remove a rule under **Settings → Saved approvals**.
 
+**Settings → Tool approvals → Auto-approve tool calls (at your own risk)** is off by default. Enable it and click **Save settings** to let new messages run terminal commands and MCP tools without confirmation. Those calls show **Auto-approved · Global setting** in Chat and are tracked in `agent-debug.jsonl`. Turn the setting off and save to return to individual approvals and saved rules.
+
 ### Update a skill
 
 | What changed | What to do |
