@@ -148,9 +148,11 @@ impl Connection {
         let mut body = json!({
             "model": model,
             "messages": messages,
-            "tools": tools,
             "stream": false
         });
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
         match thinking {
             Some(ThinkingSetting::Effort(effort)) => body["reasoning_effort"] = json!(effort),
             Some(ThinkingSetting::Toggle(enabled)) => llama_cpp::set_thinking(&mut body, *enabled),

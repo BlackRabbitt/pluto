@@ -41,6 +41,12 @@ Open a saved conversation from **Recent chats** in the sidebar or select **New c
 
 Open a saved conversation and click **Archive chat** to move its file into `chats/archive`. Open it under **Archived chats** to read it, or click **Restore chat** to move it back and continue the conversation.
 
+### Debug a tool-heavy turn
+
+Pluto writes `agent-debug.jsonl` beside `tools.toml` in the background. Group lines by `process` and `turn` to follow model requests, MCP discovery, tool calls, approvals, timings, and the tool limit. Calls with identical argument text share an `arguments_id` within a turn. The log records metadata and names. Prompts, raw arguments, credentials, and tool output are omitted. Pluto keeps the current log and one previous log, up to 2 MiB each.
+
+If a batch would exceed 52 tool calls, Pluto skips that batch and asks the model for a partial answer using the results already gathered. The final request runs with tools disabled.
+
 ## Add a skill and use a CLI
 
 1. Install the app's CLI independently and make sure the command is on the PATH inherited by Pluto.

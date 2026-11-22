@@ -1,4 +1,5 @@
 mod agent;
+mod diagnostics;
 mod history;
 mod providers;
 mod tools;
@@ -583,6 +584,7 @@ struct Desktop {
     runtime: tokio::runtime::Runtime,
     events: mpsc::Receiver<Event>,
     sender: mpsc::Sender<Event>,
+    diagnostics: Option<diagnostics::LogSender>,
     config: Config,
     discovery_client: reqwest::Client,
     discovery_connection: Option<Connection>,
@@ -630,11 +632,21 @@ impl Desktop {
                 format!("{error:#}. Fix the file and relaunch before saving settings."),
             ),
         };
-        let (chat_store, history_notice) = match Config::path() {
-            Ok(path) => (Some(ChatStore::beside(&path)), None),
-            Err(error) => (None, Some(format!("Chat history unavailable: {error:#}"))),
+        let (chat_store, history_notice, diagnostics) = match Config::path() {
+            Ok(path) => (
+                Some(ChatStore::beside(&path)),
+                None,
+                diagnostics::start(path.with_file_name("agent-debug.jsonl")).ok(),
+            ),
+            Err(error) => (
+                None,
+                Some(format!("Chat history unavailable: {error:#}")),
+                None,
+            ),
         };
-        Self::with_config(config, notice, chat_store, history_notice)
+        let mut desktop = Self::with_config(config, notice, chat_store, history_notice)?;
+        desktop.diagnostics = diagnostics;
+        Ok(desktop)
     }
 
     fn with_config(
@@ -701,6 +713,7 @@ impl Desktop {
             context_usage: None,
             events,
             sender,
+            diagnostics: None,
             notice,
             history,
             markdown_cache: CommonMarkCache::default(),
@@ -753,13 +766,18 @@ impl Desktop {
         let history = self.history.clone();
         let thinking = self.thinking_setting.clone();
         let sender = self.sender.clone();
+        let trace = diagnostics::Trace::new(self.diagnostics.clone());
         let context = context.clone();
         self.runtime.spawn(async move {
             let emit = |event| {
                 let _ = sender.send(event);
                 context.request_repaint();
             };
-            let result = agent::chat(config, history, thinking, selection, emit).await;
+            let result = agent::chat(config, history, thinking, selection, &trace, emit).await;
+            trace.record(
+                "turn_finished",
+                || serde_json::json!({"reply_returned": result.is_ok()}),
+            );
             emit(Event::Finished(result));
         });
     }

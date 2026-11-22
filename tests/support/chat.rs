@@ -1,4 +1,5 @@
-use crate::agent::{ApprovalDecision, Event, TokenUsage, TurnSelection, chat};
+use crate::agent::{self, ApprovalDecision, Event, TokenUsage, TurnSelection};
+use crate::diagnostics::Trace;
 use crate::providers::{Provider, ThinkingSetting};
 use crate::tools::{ApprovalRule, Config, Mcp, McpToolId, ToolSet};
 use anyhow::{Context, Result};
@@ -8,6 +9,24 @@ use std::{fs, path::Path, process::Stdio};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::process::Command;
+
+async fn chat(
+    config: Config,
+    history: Vec<(String, String)>,
+    thinking: Option<ThinkingSetting>,
+    selection: Option<TurnSelection>,
+    emit: impl Fn(Event),
+) -> Result<String> {
+    agent::chat(
+        config,
+        history,
+        thinking,
+        selection,
+        &Trace::default(),
+        emit,
+    )
+    .await
+}
 
 async fn http_fixture(script: &Path) -> Result<(Child, u16)> {
     let mut http = Command::new("python3")
@@ -34,24 +53,32 @@ async fn http_fixture(script: &Path) -> Result<(Child, u16)> {
 async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;
-    for overflow in [false, true] {
+    for (model, expected_answer) in [
+        ("tool-limit-fixture", "52 tool calls completed"),
+        (
+            "tool-limit-overflow-fixture",
+            "Summary of the 52 completed requests",
+        ),
+        (
+            "tool-limit-no-summary-fixture",
+            "The model did not return a summary",
+        ),
+    ] {
         let config = Config {
             model_provider: Some(Provider::OpenAiCompatible),
             model_url: format!("http://127.0.0.1:{port}/v1"),
-            model_name: if overflow {
-                "tool-limit-overflow-fixture"
-            } else {
-                "tool-limit-fixture"
-            }
-            .into(),
+            model_name: model.into(),
             ..Config::default()
         };
         let calls = std::cell::Cell::new(0);
-        let result = chat(
+        let (log, entries) = std::sync::mpsc::sync_channel(512);
+        let trace = Trace::new(Some(log));
+        let result = agent::chat(
             config,
             vec![("user".into(), "Run the fixture".into())],
             None,
             None,
+            &trace,
             |event| {
                 if matches!(event, Event::Status(status) if status == "Running · Find MCP tools") {
                     calls.set(calls.get() + 1);
@@ -60,12 +87,38 @@ async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
         )
         .await;
         assert_eq!(calls.get(), 52);
-        if overflow {
-            let error = result.expect_err("Expected the tool-call limit to stop the next batch");
-            assert!(error.to_string().contains("52 tool calls"));
-        } else {
-            assert_eq!(result?, "52 tool calls completed");
-        }
+        let entries: Vec<Value> = entries
+            .try_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["event"] == "tool_finished")
+                .count(),
+            52
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.to_string().contains("Run the fixture"))
+        );
+        assert!(result?.contains(expected_answer));
+        let final_requests: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry["event"] == "model_request" && entry["details"]["partial"] == true
+            })
+            .collect();
+        assert_eq!(
+            final_requests.len(),
+            usize::from(model != "tool-limit-fixture")
+        );
+        assert!(
+            final_requests
+                .iter()
+                .all(|entry| entry["details"]["tools_offered"] == 0)
+        );
     }
     Ok(())
 }

@@ -60,8 +60,14 @@ def tool_discovery_model(request):
 
 
 def model(request):
-    if request["model"] in ("tool-limit-fixture", "tool-limit-overflow-fixture"):
+    if request["model"].startswith("tool-limit-"):
         count = sum(item["role"] == "tool" for item in request["messages"])
+        if "tools" not in request:
+            assert request["model"] != "tool-limit-fixture" and count == 52
+            assert "Give a partial answer" in request["messages"][0]["content"]
+            if request["model"] == "tool-limit-no-summary-fixture":
+                return tool_call(count, "find_tools", {"query": "ignored"})
+            return {"choices": [{"message": {"content": "Summary of the 52 completed requests"}}]}
         if count == 52 and request["model"] == "tool-limit-fixture":
             return {"choices": [{"message": {"content": "52 tool calls completed"}}]}
         reply = tool_call(count, "find_tools", {"query": "fixture"})
