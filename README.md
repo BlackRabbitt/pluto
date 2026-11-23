@@ -18,24 +18,23 @@ On Linux, Pluto needs a graphical desktop and working OpenGL drivers. On macOS, 
 
 1. If the Xcode Command Line Tools are missing, run `xcode-select --install` in Terminal and finish the installer. If Rustup is missing, install it and open a new Terminal window. [Apple Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools) · [Rustup](https://rustup.rs/)
 2. Download and unzip the [Pluto source ZIP](https://github.com/BlackRabbitt/pluto/archive/refs/heads/main.zip), or use a copy of the source archive you already have. In Terminal, enter the extracted folder that contains `Cargo.toml`.
-3. Build and install Pluto for your user account. Cargo downloads the build dependencies on the first install.
+3. Run the installer. It downloads the required Rust toolchain and build dependencies as needed.
 
    ```sh
-   rustup toolchain install 1.100.0
-   cargo +1.100.0 install --locked --path .
+   sh install-macos.sh
    ```
 
-Run `pluto` from Terminal. With a default Rustup setup, the executable is at `~/.cargo/bin/pluto`. Use that full path if `pluto` is unavailable on your `PATH`.
+Search for **Pluto** in Spotlight, or open `~/Applications/Pluto.app` in Finder. You can also run `~/.cargo/bin/pluto` from Terminal when Pluto needs environment variables or CLI paths from your shell.
 
 ### Update on macOS
 
-Quit Pluto, download a fresh source ZIP, and unzip it into a new folder. From that folder, use the Rust version specified in the archive’s README and rerun the install command. For this version, run:
+Quit Pluto, download a fresh source ZIP, and unzip it into a new folder. Run the installer from that folder.
 
 ```sh
-cargo +1.100.0 install --locked --path .
+sh install-macos.sh
 ```
 
-Cargo builds and replaces the installed executable even if Pluto’s version number is unchanged. Relaunch `pluto` from Terminal. Settings and saved chats stay in `~/Library/Application Support/pluto/`, or at the location selected through `PLUTO_CONFIG`. [Cargo install reference](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
+The same launcher opens the updated executable even if Pluto’s version number is unchanged. Settings and saved chats stay in `~/Library/Application Support/pluto/`, or at the location selected through `PLUTO_CONFIG`.
 
 ### Connect a model
 
