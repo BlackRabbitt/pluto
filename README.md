@@ -24,7 +24,7 @@ On Linux, Pluto needs a graphical desktop and working OpenGL drivers. On macOS, 
    sh install-macos.sh
    ```
 
-Search for **Pluto** in Spotlight, or open `~/Applications/Pluto.app` in Finder. You can also run `~/.cargo/bin/pluto` from Terminal when Pluto needs environment variables or CLI paths from your shell.
+Search for **Pluto** in Spotlight, or open `~/Applications/Pluto.app` in Finder. If an MCP server needs environment variables, see [MCP environment variables on macOS](#mcp-environment-variables-on-macos). You can also run `~/.cargo/bin/pluto` from Terminal to use your shell environment.
 
 ### Update on macOS
 
@@ -34,7 +34,7 @@ Quit Pluto, download a fresh source ZIP, and unzip it into a new folder. Run the
 sh install-macos.sh
 ```
 
-The same launcher opens the updated executable even if Pluto’s version number is unchanged. The installer also updates older Pluto launchers that still show the generic AppleScript icon in Spotlight. Settings and saved chats stay in `~/Library/Application Support/pluto/`, or at the location selected through `PLUTO_CONFIG`.
+The installer updates the app in your Applications folder and the Terminal executable even if Pluto’s version number is unchanged. It also replaces the AppleScript launcher created by earlier installers. Settings and saved chats stay in `~/Library/Application Support/pluto/`, or at the location selected through `PLUTO_CONFIG`.
 
 ### Connect a model
 
@@ -50,6 +50,14 @@ The same launcher opens the updated executable even if Pluto’s version number 
 | **Google AI Studio** | Pick **OpenAI-compatible** and use `https://generativelanguage.googleapis.com/v1beta/openai/`. [Google’s setup guide](https://ai.google.dev/gemini-api/docs/openai) |
 
 For an authenticated model or MCP server, export the key before launching Pluto. In Settings, enter the **variable name**, such as `GEMINI_API_KEY`. If Pluto can load the model list but chat returns a 404, check that your model ID supports text chat on that endpoint.
+
+#### Connect to a model on your local network from macOS
+
+Open the installed **Pluto** app from Spotlight. In Settings, enter the model server’s LAN address and port, then click **Load models**. Use `localhost` when the model server runs on the same Mac. For a server on another device, make sure it listens on its LAN interface and accepts connections on that port.
+
+If macOS asks to allow local network access, choose **Allow**. macOS lists Pluto under **System Settings → Privacy & Security → Local Network** after it attempts a connection that requires permission. If Pluto is already listed, make sure its switch is on. [Apple’s local network privacy guide](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+
+Source installs use ad hoc signing by default, so macOS can ask again after a rebuild. If you have an Apple-issued code-signing identity in your keychain, set `PLUTO_SIGNING_IDENTITY` to its name when running the installer. To compare whether the issue is specific to the app’s local network permission, try the same server from `~/.cargo/bin/pluto` in Terminal. macOS grants local network access to command-line tools launched from Terminal. [Apple’s macOS signing and local network guidance](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy#Build-time-considerations)
 
 ### Use Rust 1.100.0 only for Pluto
 
@@ -120,6 +128,16 @@ Small catalogs are available directly. For larger catalogs, Pluto lets the model
 For Slack, register a local MCP server that handles its own credentials, or supply a bearer token obtained through Slack’s OAuth setup for its hosted endpoint. Pluto expects the credentials to be ready before connecting. [Slack MCP setup](https://docs.slack.dev/ai/slack-mcp-server/)
 
 For web search, connect a web-search MCP server using the same steps.
+
+#### MCP environment variables on macOS
+
+When you open Pluto from Spotlight or Finder, use `launchctl setenv` to make variables available to apps launched in your current macOS login session. For example, if `MCP_TOKEN` is already exported in Terminal, run:
+
+```sh
+launchctl setenv MCP_TOKEN "$MCP_TOKEN"
+```
+
+Quit and reopen Pluto. For a remote MCP server, enter `MCP_TOKEN` in **Bearer token environment variable**. For a local MCP server, use the variable name that server expects. Other apps launched in the same session can also inherit the value. Run the command again after signing out and back in, or use `launchctl unsetenv MCP_TOKEN` to remove it for future launches.
 
 ### Approvals and live activity
 
