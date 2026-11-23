@@ -72,4 +72,5 @@ APPLESCRIPT
     fi
 fi
 
-printf '\n%s\n' 'Pluto is ready. Open Pluto from Spotlight or your Applications folder.'
+printf '\nLauncher: %s\n' "$launcher"
+printf '%s\n' 'Open Pluto from Spotlight or your Applications folder.'
