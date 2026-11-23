@@ -498,6 +498,24 @@ mod chat_layout_tests {
             assert_eq!(visible_phases, [expected]);
         }
 
+        for action in ["Retry model call", "End turn"] {
+            let (retry, mut decision) = oneshot::channel();
+            desktop.status = ChatStatus::ModelRequestFailed("HTTP 503".into(), retry);
+            let labels = render(&mut desktop, Vec::new());
+            let message_count = desktop.history.messages().len();
+            render(&mut desktop, click(find_label(&labels, action)));
+            let expected = if action == "Retry model call" {
+                Ok(())
+            } else {
+                Err(oneshot::error::TryRecvError::Closed)
+            };
+            assert_eq!(decision.try_recv(), expected);
+            assert_eq!(desktop.history.messages().len(), message_count);
+            assert!(desktop.busy);
+            let labels = render(&mut desktop, Vec::new());
+            assert!(!labels.iter().any(|(label, _)| label == "Retry model call"));
+        }
+
         desktop.status = ChatStatus::Idle;
         desktop.history.push(
             "assistant",
@@ -749,6 +767,7 @@ enum ChatStatus {
     Idle,
     Preparing(String),
     ModelRequest(ModelPhase),
+    ModelRequestFailed(String, oneshot::Sender<()>),
     Error(String),
 }
 
@@ -1908,6 +1927,9 @@ impl eframe::App for Desktop {
                     self.status = ChatStatus::ModelRequest(phase);
                     self.tool_progress = None;
                 }
+                Event::ModelRequestFailed(error, retry) => {
+                    self.status = ChatStatus::ModelRequestFailed(error, retry);
+                }
                 Event::Tool(tool) => self.tool_progress = Some(tool),
                 Event::SkillLoaded(name) => {
                     if let Some(index) = self.history.messages().len().checked_sub(1) {
@@ -2128,7 +2150,8 @@ impl Desktop {
                                         );
                                     });
                                 }
-                                ChatStatus::Error(status) => {
+                                ChatStatus::ModelRequestFailed(status, _)
+                                | ChatStatus::Error(status) => {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(status)
@@ -2137,6 +2160,31 @@ impl Desktop {
                                         )
                                         .wrap(),
                                     );
+                                    if matches!(self.status, ChatStatus::ModelRequestFailed(..)) {
+                                        let (retry, end_turn) = ui
+                                            .horizontal_wrapped(|ui| {
+                                                (
+                                                    ui.button("Retry model call").clicked(),
+                                                    ui.button("End turn").clicked(),
+                                                )
+                                            })
+                                            .inner;
+                                        if retry || end_turn {
+                                            let next_status = if retry {
+                                                ChatStatus::Preparing(
+                                                    "Retrying model request…".into(),
+                                                )
+                                            } else {
+                                                ChatStatus::Idle
+                                            };
+                                            if let ChatStatus::ModelRequestFailed(_, decision) =
+                                                std::mem::replace(&mut self.status, next_status)
+                                                && retry
+                                            {
+                                                let _ = decision.send(());
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

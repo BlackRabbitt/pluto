@@ -108,6 +108,54 @@ async fn global_auto_approval_runs_and_tracks_terminal_and_mcp_calls() -> Result
 }
 
 #[tokio::test]
+async fn retry_model_call_after_503_reuses_tool_result() -> Result<()> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
+    let (_http, port) = http_fixture(&script).await?;
+    let config = Config {
+        model_provider: Some(Provider::OpenAiCompatible),
+        model_url: format!("http://127.0.0.1:{port}/v1"),
+        model_name: "model-retry-fixture".into(),
+        ..Config::default()
+    };
+    let (log, entries) = std::sync::mpsc::sync_channel(64);
+    let trace = Trace::new(Some(log));
+    let retries = std::cell::Cell::new(0);
+    let answer = agent::chat(
+        config,
+        vec![("user".into(), "Run the fixture".into())],
+        None,
+        None,
+        &trace,
+        |event| match event {
+            Event::Approve(_, decision) => {
+                assert!(decision.send(ApprovalDecision::RunOnce).is_ok());
+            }
+            Event::ModelRequestFailed(error, retry) => {
+                assert!(error.contains("503"), "{error}");
+                assert_eq!(retries.replace(1), 0, "Expected one retry prompt");
+                retry.send(()).unwrap();
+            }
+            _ => {}
+        },
+    )
+    .await?;
+    assert_eq!(retries.get(), 1);
+    assert_eq!(answer, "Reused the tool result");
+    let entries: Vec<Value> = entries
+        .try_iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["event"] == "tool_finished")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;

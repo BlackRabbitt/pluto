@@ -15,6 +15,7 @@ const MAX_TOOL_CALLS_PER_TURN: usize = 52;
 
 pub enum Event {
     ModelRequest(ModelPhase),
+    ModelRequestFailed(String, oneshot::Sender<()>),
     Tool(ToolProgress),
     SkillLoaded(String),
     Warning(String),
@@ -27,6 +28,7 @@ pub enum Event {
     Finished(Result<String>),
 }
 
+#[derive(Clone, Copy)]
 pub enum ModelPhase {
     Thinking,
     ReviewingToolResults,
@@ -187,61 +189,74 @@ pub async fn chat(
         } else {
             ModelPhase::ReviewingToolResults
         };
-        emit(Event::ModelRequest(phase));
-        request_number += 1;
         let offered_tools = if finalizing { &[][..] } else { &definitions };
         let final_instructions = if finalizing {
             "\n\nThe tool budget is exhausted. Reply now without calling tools. Give a partial answer using the results already available. State what was completed, what is uncertain, and what remains. Never claim an unexecuted action succeeded."
         } else {
             ""
         };
-        let now = Local::now();
-        let zone = timezone
-            .clone()
-            .unwrap_or_else(|| format!("UTC{}", now.format("%:z")));
-        let timestamp = now.to_rfc3339_opts(SecondsFormat::Secs, false);
-        messages[0]["content"] = json!(format!(
-            "{system_prompt}{final_instructions}\n\nCurrent local date and time: {timestamp}\nLocal time zone: {zone}"
-        ));
-        trace.record("model_request", || json!({"request": request_number, "messages": messages.len(), "tools_offered": offered_tools.len(), "remaining_tool_calls": MAX_TOOL_CALLS_PER_TURN - tool_calls, "partial": finalizing}));
-        let started = Instant::now();
-        let result = async {
-            let response = connection
-                .chat_request(&client, model, &messages, offered_tools, thinking.as_ref())?
-                .send()
-                .await
-                .context("Could not reach the model endpoint")?;
-            trace.record(
-                "model_http_status",
-                || json!({"request": request_number, "status": response.status().as_u16()}),
-            );
-            ensure!(
-                response.status().is_success(),
-                "Model endpoint returned HTTP {}",
-                response.status()
-            );
-            response
-                .json::<Value>()
-                .await
-                .context("Invalid model response")
-        }
-        .await;
-        trace.record("model_finished", || json!({"request": request_number, "duration_ms": started.elapsed().as_millis(), "outcome": model_outcome(&result)}));
         let fallback = || {
             format!(
                 "**Partial result** · Pluto processed {tool_calls} tool requests and stopped before exceeding the {MAX_TOOL_CALLS_PER_TURN}-call limit. The model did not return a summary. Previously completed actions may already have taken effect."
             )
         };
-        let response = match result {
-            Ok(response) => response,
-            Err(_) if finalizing => {
+        let response = loop {
+            emit(Event::ModelRequest(phase));
+            request_number += 1;
+            let now = Local::now();
+            let zone = timezone
+                .clone()
+                .unwrap_or_else(|| format!("UTC{}", now.format("%:z")));
+            let timestamp = now.to_rfc3339_opts(SecondsFormat::Secs, false);
+            messages[0]["content"] = json!(format!(
+                "{system_prompt}{final_instructions}\n\nCurrent local date and time: {timestamp}\nLocal time zone: {zone}"
+            ));
+            trace.record("model_request", || json!({"request": request_number, "messages": messages.len(), "tools_offered": offered_tools.len(), "remaining_tool_calls": MAX_TOOL_CALLS_PER_TURN - tool_calls, "partial": finalizing}));
+            let started = Instant::now();
+            let result = async {
+                let response = connection
+                    .chat_request(&client, model, &messages, offered_tools, thinking.as_ref())?
+                    .send()
+                    .await
+                    .context("Could not reach the model endpoint")?;
+                trace.record(
+                    "model_http_status",
+                    || json!({"request": request_number, "status": response.status().as_u16()}),
+                );
+                response
+                    .error_for_status_ref()
+                    .map_err(reqwest::Error::without_url)?;
+                ensure!(
+                    response.status().is_success(),
+                    "Model endpoint returned HTTP {}",
+                    response.status()
+                );
+                response
+                    .json::<Value>()
+                    .await
+                    .context("Invalid model response")
+            }
+            .await;
+            trace.record("model_finished", || json!({"request": request_number, "duration_ms": started.elapsed().as_millis(), "outcome": model_outcome(&result)}));
+            let error = match result {
+                Ok(response) => break response,
+                Err(error) => error,
+            };
+            if retryable_model_error(&error) {
+                let (retry, decision) = oneshot::channel();
+                emit(Event::ModelRequestFailed(format!("{error:#}"), retry));
+                if decision.await.is_ok() {
+                    continue;
+                }
+            }
+            if finalizing {
                 trace.record(
                     "partial_answer",
                     || json!({"summary_returned": false, "tool_calls_processed": tool_calls}),
                 );
                 return Ok(fallback());
             }
-            Err(error) => return Err(error),
+            return Err(error);
         };
         let usage = TokenUsage::from_response(&response);
         if let Some(usage) = usage {
@@ -390,6 +405,19 @@ fn local_timezone() -> Option<String> {
         .then(|| zone.to_owned());
     }
     iana_time_zone::get_timezone().ok()
+}
+
+fn retryable_model_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        error.is_timeout()
+            || error.is_request()
+            || error.is_body()
+            || error.status().is_some_and(|status| {
+                status.is_server_error()
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            })
+    })
 }
 
 fn model_outcome(result: &Result<Value>) -> &'static str {

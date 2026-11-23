@@ -69,6 +69,18 @@ def model(request):
     assert abs((datetime.now(timezone.utc) - local_time).total_seconds()) < 60
     assert any(line.startswith("Local time zone: ") and line.removeprefix("Local time zone: ").strip()
                for line in system_prompt.splitlines())
+    if request["model"] == "model-retry-fixture":
+        messages = request["messages"][1:]
+        assert messages[0] == {"role": "user", "content": "Run the fixture"}
+        if len(messages) == 1:
+            return tool_call(0, "terminal", {"command": "printf", "args": ["%s", "retry fixture output"]})
+        assert len(messages) == 3
+        call, result = messages[1:]
+        assert call["role"] == "assistant"
+        assert result["role"] == "tool"
+        assert result["tool_call_id"] == call["tool_calls"][0]["id"] == "call_0"
+        assert json.loads(result["content"])["stdout"] == "retry fixture output"
+        return {"choices": [{"message": {"content": "Reused the tool result"}}]}
     if request["model"] == "global-approval-fixture":
         results = [item["content"] for item in request["messages"] if item["role"] == "tool"]
         if not results:
@@ -202,6 +214,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             assert self.path == "/v1/chat/completions"
             body = model(payload)
+            if payload["model"] == "model-retry-fixture" and payload["messages"][-1]["role"] == "tool":
+                retry_request = {**payload, "messages": payload["messages"][1:]}
+                if self.server.failed_model_request is None:
+                    self.server.failed_model_request = retry_request
+                    self.send_error(503)
+                    return
+                assert retry_request == self.server.failed_model_request
         self.respond(body)
 
     def respond(self, body):
@@ -223,5 +242,6 @@ if sys.argv[1] == "stdio":
             print(json.dumps(response), flush=True)
 else:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.failed_model_request = None
     print(server.server_port, flush=True)
     server.serve_forever()
