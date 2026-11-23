@@ -34,7 +34,7 @@ Quit Pluto, download a fresh source ZIP, and unzip it into a new folder. Run the
 sh install-macos.sh
 ```
 
-The same launcher opens the updated executable even if Pluto’s version number is unchanged. Settings and saved chats stay in `~/Library/Application Support/pluto/`, or at the location selected through `PLUTO_CONFIG`.
+The same launcher opens the updated executable even if Pluto’s version number is unchanged. The installer also updates older Pluto launchers that still show the generic AppleScript icon in Spotlight. Settings and saved chats stay in `~/Library/Application Support/pluto/`, or at the location selected through `PLUTO_CONFIG`.
 
 ### Connect a model
 
