@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 const MAX_TOOL_CALLS_PER_TURN: usize = 52;
 
 pub enum Event {
-    ModelRequest(String),
+    ModelRequest(ModelPhase),
     Tool(ToolProgress),
     SkillLoaded(String),
     Warning(String),
@@ -25,6 +25,12 @@ pub enum Event {
         tokens: Option<TokenUsage>,
     },
     Finished(Result<String>),
+}
+
+pub enum ModelPhase {
+    Thinking,
+    ReviewingToolResults,
+    WritingPartialAnswer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,20 +176,18 @@ pub async fn chat(
         messages.push(json!({"role":"tool","tool_call_id":call_id,"content":bounded_tool_output(instructions)}));
     }
 
-    let mut auto_approved = None;
     let mut tool_calls = 0;
     let mut request_number = 0;
     let mut finalizing = false;
     loop {
-        let status = match (finalizing, auto_approved.take()) {
-            (true, _) => "Writing a partial answer after reaching the tool limit.".into(),
-            (false, Some(activity)) => {
-                format!("Reviewing tool results · Auto-approved · {activity}")
-            }
-            (false, None) if tool_calls == 0 => "Preparing a reply".into(),
-            (false, None) => "Reviewing tool results".into(),
+        let phase = if finalizing {
+            ModelPhase::WritingPartialAnswer
+        } else if tool_calls == 0 {
+            ModelPhase::Thinking
+        } else {
+            ModelPhase::ReviewingToolResults
         };
-        emit(Event::ModelRequest(status));
+        emit(Event::ModelRequest(phase));
         request_number += 1;
         let offered_tools = if finalizing { &[][..] } else { &definitions };
         let final_instructions = if finalizing {
@@ -344,12 +348,6 @@ pub async fn chat(
                                 } else {
                                     ToolPhase::AutoApproved
                                 };
-                                let label = if config.auto_approve_tools {
-                                    format!("Global setting · {activity}")
-                                } else {
-                                    activity.to_string()
-                                };
-                                auto_approved = Some(label);
                             }
                         }
                     }

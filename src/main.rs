@@ -8,7 +8,9 @@ mod tools;
 #[path = "../tests/support/chat.rs"]
 mod chat_test;
 
-use agent::{ApprovalDecision, Event, TokenUsage, ToolPhase, ToolProgress, TurnSelection};
+use agent::{
+    ApprovalDecision, Event, ModelPhase, TokenUsage, ToolPhase, ToolProgress, TurnSelection,
+};
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -476,9 +478,25 @@ mod chat_layout_tests {
 
         desktop.prompt.clear();
         desktop.busy = true;
-        desktop.status = ChatStatus::Thinking("Preparing a reply".into());
-        let labels = render(&mut desktop, Vec::new());
-        assert!(find_label(&labels, "Thinking…").y < find_label(&labels, "Preparing a reply").y);
+        let phases = [
+            (ModelPhase::Thinking, "Thinking…"),
+            (ModelPhase::ReviewingToolResults, "Reviewing tool results…"),
+            (
+                ModelPhase::WritingPartialAnswer,
+                "Writing a partial answer…",
+            ),
+        ];
+        let phase_labels = phases.each_ref().map(|(_, label)| *label);
+        for (phase, expected) in phases {
+            desktop.status = ChatStatus::ModelRequest(phase);
+            let labels = render(&mut desktop, Vec::new());
+            let visible_phases = labels
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .filter(|label| phase_labels.contains(label))
+                .collect::<Vec<_>>();
+            assert_eq!(visible_phases, [expected]);
+        }
 
         desktop.status = ChatStatus::Idle;
         desktop.history.push(
@@ -730,7 +748,7 @@ struct PickerCatalog {
 enum ChatStatus {
     Idle,
     Preparing(String),
-    Thinking(String),
+    ModelRequest(ModelPhase),
     Error(String),
 }
 
@@ -1886,8 +1904,8 @@ impl eframe::App for Desktop {
         self.sync_discovery();
         while let Ok(event) = self.events.try_recv() {
             match event {
-                Event::ModelRequest(status) => {
-                    self.status = ChatStatus::Thinking(status);
+                Event::ModelRequest(phase) => {
+                    self.status = ChatStatus::ModelRequest(phase);
                     self.tool_progress = None;
                 }
                 Event::Tool(tool) => self.tool_progress = Some(tool),
@@ -2093,21 +2111,23 @@ impl Desktop {
                                         );
                                     });
                                 }
-                                ChatStatus::Thinking(status) => thinking_frame(ui, |ui| {
-                                    ui.horizontal_top(|ui| {
+                                ChatStatus::ModelRequest(phase) => {
+                                    let label = match phase {
+                                        ModelPhase::Thinking => "Thinking…",
+                                        ModelPhase::ReviewingToolResults => {
+                                            "Reviewing tool results…"
+                                        }
+                                        ModelPhase::WritingPartialAnswer => {
+                                            "Writing a partial answer…"
+                                        }
+                                    };
+                                    ui.horizontal(|ui| {
                                         ui.spinner();
-                                        ui.vertical(|ui| {
-                                            ui.spacing_mut().item_spacing.y = 2.0;
-                                            ui.label(RichText::new("Thinking…").strong());
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(status).small().weak(),
-                                                )
-                                                .wrap(),
-                                            );
-                                        });
+                                        ui.add(
+                                            egui::Label::new(RichText::new(label).small()).wrap(),
+                                        );
                                     });
-                                }),
+                                }
                                 ChatStatus::Error(status) => {
                                     ui.add(
                                         egui::Label::new(

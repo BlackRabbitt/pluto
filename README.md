@@ -81,7 +81,7 @@ channel = "1.100.0"
 ## Chat
 
 - Use the **Thinking** menu to select a level or toggle when llama.cpp or Ollama reports support. **Server default** uses the server’s own behavior. The choice applies to subsequent messages with that model.
-- Chat shows a **Thinking…** panel while waiting for a model response. When a model includes a leading `<think>` block in its reply, expand **Model thinking** to see it.
+- While waiting for a model response, Chat shows a spinner and the current phase: **Thinking…**, **Reviewing tool results…**, or **Writing a partial answer…**. When a model includes a leading `<think>` block in its reply, expand **Model thinking** to see it.
 - Chat shows token usage when the model reports it. For llama.cpp, it also shows the context window reported by the server. Change the llama.cpp context size when launching the server.
 - Pluto sends the full transcript of the open chat and the computer’s local date, time, and time zone to the configured model. New messages show a timestamp below the sender name.
 - Reopen conversations under **Recent chats**. Pluto opens the most recently updated chat on launch. Use **Archive chat** to move a conversation out of the recent list, and **Restore chat** to continue it.
