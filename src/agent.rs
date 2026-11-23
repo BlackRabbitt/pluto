@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 const MAX_TOOL_CALLS_PER_TURN: usize = 52;
 
 pub enum Event {
-    Status(String),
+    ModelRequest(String),
     Tool(ToolProgress),
     SkillLoaded(String),
     Warning(String),
@@ -176,14 +176,14 @@ pub async fn chat(
     let mut finalizing = false;
     loop {
         let status = match (finalizing, auto_approved.take()) {
-            (true, _) => "Tool limit reached · Writing a partial answer…".into(),
+            (true, _) => "Writing a partial answer after reaching the tool limit.".into(),
             (false, Some(activity)) => {
-                format!("{APP_NAME} is reviewing the tool results… · Auto-approved · {activity}")
+                format!("Reviewing tool results · Auto-approved · {activity}")
             }
-            (false, None) if tool_calls == 0 => format!("{APP_NAME} is preparing a reply…"),
-            (false, None) => format!("{APP_NAME} is reviewing the tool results…"),
+            (false, None) if tool_calls == 0 => "Preparing a reply".into(),
+            (false, None) => "Reviewing tool results".into(),
         };
-        emit(Event::Status(status));
+        emit(Event::ModelRequest(status));
         request_number += 1;
         let offered_tools = if finalizing { &[][..] } else { &definitions };
         let final_instructions = if finalizing {

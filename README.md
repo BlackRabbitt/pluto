@@ -14,6 +14,29 @@ cargo run --locked
 
 On Linux, Pluto needs a graphical desktop and working OpenGL drivers. On macOS, launch it from a terminal if Pluto needs your shell’s API keys or access to CLI commands on your PATH.
 
+### Install on macOS from a source archive
+
+1. If the Xcode Command Line Tools are missing, run `xcode-select --install` in Terminal and finish the installer. If Rustup is missing, install it and open a new Terminal window. [Apple Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools) · [Rustup](https://rustup.rs/)
+2. Download and unzip the [Pluto source ZIP](https://github.com/BlackRabbitt/pluto/archive/refs/heads/main.zip), or use a copy of the source archive you already have. In Terminal, enter the extracted folder that contains `Cargo.toml`.
+3. Build and install Pluto for your user account. Cargo downloads the build dependencies on the first install.
+
+   ```sh
+   rustup toolchain install 1.100.0
+   cargo +1.100.0 install --locked --path .
+   ```
+
+Run `pluto` from Terminal. With a default Rustup setup, the executable is at `~/.cargo/bin/pluto`. Use that full path if `pluto` is unavailable on your `PATH`.
+
+### Update on macOS
+
+Quit Pluto, download a fresh source ZIP, and unzip it into a new folder. From that folder, use the Rust version specified in the archive’s README and rerun the install command. For this version, run:
+
+```sh
+cargo +1.100.0 install --locked --path .
+```
+
+Cargo builds and replaces the installed executable even if Pluto’s version number is unchanged. Relaunch `pluto` from Terminal. Settings and saved chats stay in `~/Library/Application Support/pluto/`, or at the location selected through `PLUTO_CONFIG`. [Cargo install reference](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
+
 ### Connect a model
 
 1. Open **Settings** and pick a provider.
@@ -51,6 +74,7 @@ channel = "1.100.0"
 ## Chat
 
 - Use the **Thinking** menu to select a level or toggle when llama.cpp or Ollama reports support. **Server default** uses the server’s own behavior. The choice applies to subsequent messages with that model.
+- Chat shows a **Thinking…** panel while waiting for a model response. When a model includes a leading `<think>` block in its reply, expand **Model thinking** to see it.
 - Chat shows token usage when the model reports it. For llama.cpp, it also shows the context window reported by the server. Change the llama.cpp context size when launching the server.
 - Pluto sends the full transcript of the open chat and the computer’s local date, time, and time zone to the configured model. New messages show a timestamp below the sender name.
 - Reopen conversations under **Recent chats**. Pluto opens the most recently updated chat on launch. Use **Archive chat** to move a conversation out of the recent list, and **Restore chat** to continue it.

@@ -179,6 +179,19 @@ fn chat_message(
             if assistant {
                 // Markdown tables derive their IDs from the reply's UI scope.
                 ui.push_id(("reply", id_salt), |ui| {
+                    let (thinking, answer) = split_thinking(content);
+                    if let Some(thinking) = thinking {
+                        thinking_frame(ui, |ui| {
+                            egui::CollapsingHeader::new(RichText::new("Model thinking").strong())
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(thinking).small().weak())
+                                            .wrap()
+                                            .selectable(true),
+                                    );
+                                });
+                        });
+                    }
                     ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
                     egui::ScrollArea::horizontal()
                         .max_width(inner_width)
@@ -186,7 +199,7 @@ fn chat_message(
                         .show(ui, |ui| {
                             ui.set_width(inner_width);
                             ui.style_mut().url_in_tooltip = true;
-                            CommonMarkViewer::new().show(ui, markdown_cache, content);
+                            CommonMarkViewer::new().show(ui, markdown_cache, answer);
                         });
                 });
             } else {
@@ -194,6 +207,37 @@ fn chat_message(
             }
         })
         .response
+}
+
+fn split_thinking(content: &str) -> (Option<&str>, &str) {
+    let Some((thinking, answer)) = content
+        .trim_start()
+        .strip_prefix("<think>")
+        .and_then(|text| text.split_once("</think>"))
+    else {
+        return (None, content);
+    };
+    let thinking = thinking.trim();
+    (
+        (!thinking.is_empty()).then_some(thinking),
+        answer.trim_start_matches(['\r', '\n']),
+    )
+}
+
+fn thinking_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    Frame::new()
+        .fill(ui.visuals().panel_fill)
+        .stroke(ui.visuals().window_stroke)
+        .corner_radius(8)
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(
+                ui.available_width()
+                    .min(ui.clip_rect().right() - ui.min_rect().left())
+                    .max(1.0),
+            );
+            add_contents(ui);
+        });
 }
 
 fn tool_progress_ui(ui: &mut egui::Ui, tool: &ToolProgress) {
@@ -432,6 +476,30 @@ mod chat_layout_tests {
 
         desktop.prompt.clear();
         desktop.busy = true;
+        desktop.status = ChatStatus::Thinking("Preparing a reply".into());
+        let labels = render(&mut desktop, Vec::new());
+        assert!(find_label(&labels, "Thinking…").y < find_label(&labels, "Preparing a reply").y);
+
+        desktop.status = ChatStatus::Idle;
+        desktop.history.push(
+            "assistant",
+            "<think>Check the fixture.</think>\n\n**Fixture verified.**".into(),
+        );
+        let labels = render(&mut desktop, Vec::new());
+        let header = find_label(&labels, "Model thinking");
+        assert!(header.y < find_label(&labels, "Fixture verified.").y);
+        assert!(
+            !labels
+                .iter()
+                .any(|(label, _)| label == "Check the fixture.")
+        );
+        render(&mut desktop, click(header));
+        let labels = render(&mut desktop, Vec::new());
+        assert!(
+            find_label(&labels, "Check the fixture.").y
+                < find_label(&labels, "Fixture verified.").y
+        );
+
         desktop.tool_progress = Some(ToolProgress {
             activity: tools::ToolActivity {
                 name: "fixture / lookup".into(),
@@ -659,6 +727,13 @@ struct PickerCatalog {
     warnings: Vec<String>,
 }
 
+enum ChatStatus {
+    Idle,
+    Preparing(String),
+    Thinking(String),
+    Error(String),
+}
+
 struct Desktop {
     logo: Option<egui::TextureHandle>,
     runtime: tokio::runtime::Runtime,
@@ -687,7 +762,7 @@ struct Desktop {
     picker_index: usize,
     settings: bool,
     busy: bool,
-    status: String,
+    status: ChatStatus,
     tool_progress: Option<ToolProgress>,
     loaded_skills: BTreeMap<usize, BTreeSet<String>>,
     notice: String,
@@ -812,7 +887,7 @@ impl Desktop {
             picker_catalog: Lookup::Idle,
             picker_index: 0,
             busy: false,
-            status: String::new(),
+            status: ChatStatus::Idle,
             tool_progress: None,
             loaded_skills: BTreeMap::new(),
             connection_errors: Vec::new(),
@@ -837,10 +912,10 @@ impl Desktop {
             return;
         }
         let selection = self.selection.take();
-        self.status = match &selection {
+        self.status = ChatStatus::Preparing(match &selection {
             Some(TurnSelection::Skill(name)) => format!("Preparing to load skill · {name}…"),
             _ => "Discovering tools…".into(),
-        };
+        });
         self.tool_progress = None;
         self.connection_errors.clear();
         self.busy = true;
@@ -1102,7 +1177,7 @@ impl Desktop {
         self.history = history;
         self.loaded_skills.clear();
         self.context_usage = None;
-        self.status.clear();
+        self.status = ChatStatus::Idle;
         self.tool_progress = None;
         self.connection_errors.clear();
         self.history_notice = None;
@@ -1811,8 +1886,8 @@ impl eframe::App for Desktop {
         self.sync_discovery();
         while let Ok(event) = self.events.try_recv() {
             match event {
-                Event::Status(status) => {
-                    self.status = status;
+                Event::ModelRequest(status) => {
+                    self.status = ChatStatus::Thinking(status);
                     self.tool_progress = None;
                 }
                 Event::Tool(tool) => self.tool_progress = Some(tool),
@@ -1850,7 +1925,7 @@ impl eframe::App for Desktop {
                 Event::Usage { .. } => {}
                 Event::Finished(result) => {
                     self.busy = false;
-                    self.status.clear();
+                    self.status = ChatStatus::Idle;
                     self.tool_progress = None;
                     match result {
                         Ok(answer) => {
@@ -1858,7 +1933,7 @@ impl eframe::App for Desktop {
                             self.chat_dirty = true;
                             self.persist_chat();
                         }
-                        Err(error) => self.status = format!("{error:#}"),
+                        Err(error) => self.status = ChatStatus::Error(format!("{error:#}")),
                     }
                 }
             }
@@ -2006,21 +2081,44 @@ impl Desktop {
                         }
                         if let Some(tool) = &self.tool_progress {
                             tool_progress_ui(ui, tool);
-                        } else if !self.status.is_empty() {
-                            ui.horizontal(|ui| {
-                                if self.busy && self.approval.is_none() {
-                                    ui.spinner();
+                        } else {
+                            match &self.status {
+                                ChatStatus::Idle => {}
+                                ChatStatus::Preparing(status) => {
+                                    ui.horizontal_top(|ui| {
+                                        ui.spinner();
+                                        ui.add(
+                                            egui::Label::new(RichText::new(status).small().weak())
+                                                .wrap(),
+                                        );
+                                    });
                                 }
-                                let text = RichText::new(&self.status).small();
-                                ui.add(
-                                    egui::Label::new(if self.busy {
-                                        text.weak()
-                                    } else {
-                                        text.color(ui.visuals().warn_fg_color)
-                                    })
-                                    .wrap(),
-                                );
-                            });
+                                ChatStatus::Thinking(status) => thinking_frame(ui, |ui| {
+                                    ui.horizontal_top(|ui| {
+                                        ui.spinner();
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 2.0;
+                                            ui.label(RichText::new("Thinking…").strong());
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(status).small().weak(),
+                                                )
+                                                .wrap(),
+                                            );
+                                        });
+                                    });
+                                }),
+                                ChatStatus::Error(status) => {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(status)
+                                                .small()
+                                                .color(ui.visuals().warn_fg_color),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            }
                         }
                     });
             });
