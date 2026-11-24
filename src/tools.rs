@@ -28,11 +28,8 @@ use tokio::{
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    pub model_provider: Option<Provider>,
-    pub model_url: String,
-    pub model_name: String,
-    pub model_token_env: String,
-    pub model_context_limit: u32,
+    pub models: ModelSettings,
+    pub model_fallbacks: crate::model_fallback::FallbackSettings,
     pub workspace: PathBuf,
     pub auto_approve_tools: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -41,6 +38,62 @@ pub struct Config {
     pub mcp_approvals: Vec<McpApproval>,
     pub skills: BTreeMap<String, Skill>,
     pub mcp: BTreeMap<String, Mcp>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelMode {
+    #[default]
+    LocalOnly,
+    OpenAiCompatible,
+}
+
+impl ModelMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "Local only",
+            Self::OpenAiCompatible => "OpenAI-compatible",
+        }
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ModelSettings {
+    pub mode: ModelMode,
+    pub local: ModelProfile,
+    pub openai: ModelProfile,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ModelProfile {
+    pub provider: Option<Provider>,
+    pub url: String,
+    pub name: String,
+    pub token_env: String,
+    pub context_limit: u32,
+}
+
+impl ModelSettings {
+    pub fn profile(&self, mode: ModelMode) -> &ModelProfile {
+        match mode {
+            ModelMode::LocalOnly => &self.local,
+            ModelMode::OpenAiCompatible => &self.openai,
+        }
+    }
+
+    pub fn connection(&self, mode: ModelMode) -> Result<Connection> {
+        let profile = self.profile(mode);
+        let provider = match mode {
+            ModelMode::LocalOnly => match profile.provider {
+                Some(provider @ (Provider::LlamaCpp | Provider::Ollama)) => provider,
+                _ => anyhow::bail!("Choose llama.cpp or Ollama for the local model"),
+            },
+            ModelMode::OpenAiCompatible => Provider::OpenAiCompatible,
+        };
+        Connection::new(provider, &profile.url, &profile.token_env)
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -159,11 +212,8 @@ pub enum Mcp {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_provider: None,
-            model_url: String::new(),
-            model_name: String::new(),
-            model_token_env: String::new(),
-            model_context_limit: 0,
+            models: ModelSettings::default(),
+            model_fallbacks: Default::default(),
             workspace: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             auto_approve_tools: false,
             terminal_approvals: Vec::new(),
@@ -233,11 +283,7 @@ impl Config {
     }
 
     pub fn model_connection(&self) -> Result<Connection> {
-        Connection::new(
-            self.model_provider.context("Choose a model provider")?,
-            &self.model_url,
-            &self.model_token_env,
-        )
+        self.models.connection(self.models.mode)
     }
 
     pub fn path() -> Result<PathBuf> {
@@ -270,12 +316,35 @@ impl Config {
     fn load_from(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
             Ok(text) => {
-                let mut config: Self =
+                let mut table: toml::Table =
                     toml::from_str(&text).with_context(|| format!("Invalid {}", path.display()))?;
-                if config.model_provider.is_none() && !config.model_url.trim().is_empty() {
-                    config.model_provider = Some(Provider::OpenAiCompatible);
+                if !table.contains_key("models") {
+                    let mut profile: ModelProfile = [
+                        ("model_provider", "provider"),
+                        ("model_url", "url"),
+                        ("model_name", "name"),
+                        ("model_token_env", "token_env"),
+                        ("model_context_limit", "context_limit"),
+                    ]
+                    .into_iter()
+                    .filter_map(|(old, new)| table.remove(old).map(|value| (new.into(), value)))
+                    .collect::<toml::Table>()
+                    .try_into()?;
+                    let mut models = ModelSettings::default();
+                    if profile.provider == Some(Provider::OpenAiCompatible)
+                        || (profile.provider.is_none() && !profile.url.trim().is_empty())
+                    {
+                        profile.provider = None;
+                        models.mode = ModelMode::OpenAiCompatible;
+                        models.openai = profile;
+                    } else {
+                        models.local = profile;
+                    }
+                    table.insert("models".into(), toml::Value::try_from(models)?);
                 }
-                Ok(config)
+                table
+                    .try_into()
+                    .with_context(|| format!("Invalid {}", path.display()))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error).with_context(|| format!("Could not read {}", path.display())),
@@ -917,16 +986,57 @@ mod tests {
     }
 
     #[test]
+    fn model_settings_migrate_legacy_profiles() -> Result<()> {
+        let directory =
+            env::temp_dir().join(format!("pluto-model-settings-{}", std::process::id()));
+        fs::create_dir(&directory)?;
+        let path = directory.join("tools.toml");
+        let result = (|| -> Result<()> {
+            for (legacy_provider, mode) in [
+                ("model_provider = 'llama_cpp'\n", ModelMode::LocalOnly),
+                (
+                    "model_provider = 'open_ai_compatible'\n",
+                    ModelMode::OpenAiCompatible,
+                ),
+                ("", ModelMode::OpenAiCompatible),
+            ] {
+                fs::write(
+                    &path,
+                    format!(
+                        "{legacy_provider}model_url = 'http://localhost:8080/v1'\nmodel_name = 'existing'\nmodel_context_limit = 32768\n"
+                    ),
+                )?;
+                let mut config = Config::load_from(&path)?;
+                assert_eq!(config.models.mode, mode);
+                assert_eq!(config.models.profile(mode).name, "existing");
+                assert_eq!(config.models.profile(mode).context_limit, 32768);
+                if mode == ModelMode::OpenAiCompatible {
+                    config.models.local.provider = Some(Provider::Ollama);
+                    config.models.local.url = "http://localhost:11434".into();
+                    config.models.local.name = "local".into();
+                    config.models.mode = ModelMode::LocalOnly;
+                    config.save_to(&path)?;
+                    let saved = Config::load_from(&path)?;
+                    assert_eq!(saved.models.mode, ModelMode::LocalOnly);
+                    assert_eq!(saved.model_connection()?.provider, Provider::Ollama);
+                    assert_eq!(saved.models.openai.name, "existing");
+                }
+            }
+            Ok(())
+        })();
+        fs::remove_dir_all(directory)?;
+        result
+    }
+
+    #[test]
     fn mcp_changes_require_an_explicit_save() -> Result<()> {
         let directory =
             env::temp_dir().join(format!("pluto-mcp-settings-test-{}", std::process::id()));
         fs::create_dir(&directory)?;
         let path = directory.join("tools.toml");
         let result = (|| -> Result<()> {
-            let mut config = Config {
-                model_name: "Existing model".into(),
-                ..Config::default()
-            };
+            let mut config = Config::default();
+            config.models.local.name = "Existing model".into();
             config.save_to(&path)?;
             let server = Mcp::Stdio {
                 command: "python3".into(),
@@ -936,7 +1046,7 @@ mod tests {
             assert!(Config::load_from(&path)?.mcp.is_empty());
             config.save_to(&path)?;
             let mut reopened = Config::load_from(&path)?;
-            assert_eq!(reopened.model_name, "Existing model");
+            assert_eq!(reopened.models.local.name, "Existing model");
             assert!(reopened.mcp.get("fixture") == Some(&server));
 
             let approval = ApprovalRule::Mcp(McpApproval {
@@ -954,7 +1064,7 @@ mod tests {
             let reopened = Config::load_from(&path)?;
             assert!(reopened.mcp.is_empty());
             assert!(reopened.mcp_approvals.is_empty());
-            assert_eq!(reopened.model_name, "Existing model");
+            assert_eq!(reopened.models.local.name, "Existing model");
             Ok(())
         })();
         fs::remove_dir_all(directory)?;

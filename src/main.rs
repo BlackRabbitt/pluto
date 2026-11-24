@@ -1,6 +1,7 @@
 mod agent;
 mod diagnostics;
 mod history;
+mod model_fallback;
 mod providers;
 mod tools;
 
@@ -15,16 +16,19 @@ use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use history::{ChatEntry, ChatHistory, ChatStore};
-use providers::{Connection, ModelCapabilities, Provider, ThinkingSetting};
+use model_fallback::{FallbackSettings, MAX_FALLBACK_MODELS, ModelCooldowns};
+use providers::{Connection, FallbackMetadata, ModelCapabilities, Provider, ThinkingSetting};
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::Duration,
 };
 use tokio::sync::oneshot;
-use tools::{ApprovalRequest, ApprovalRule, Config, Mcp, McpToolId, ToolSet};
+use tools::{
+    ApprovalRequest, ApprovalRule, Config, Mcp, McpToolId, ModelMode, ModelSettings, ToolSet,
+};
 
 const APP_NAME: &str = "Pluto";
 const CHAT_DRAFT_HEIGHT: f32 = 80.0;
@@ -274,10 +278,8 @@ mod chat_layout_tests {
 
     #[test]
     fn compatible_context_meter_uses_input_tokens_and_the_selected_limit() -> Result<()> {
-        let config = Config {
-            model_provider: Some(Provider::OpenAiCompatible),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.models.mode = ModelMode::OpenAiCompatible;
         let context = egui::Context::default();
         let mut desktop = Desktop::with_config(config, String::new(), None, None)?;
         desktop.context_usage = Some(TokenUsage {
@@ -298,7 +300,7 @@ mod chat_layout_tests {
             context_window: Some(1_000),
         }));
         assert!(shows(&desktop, "100 / 1000 input tokens"));
-        desktop.config.model_context_limit = 2_000;
+        desktop.config.models.openai.context_limit = 2_000;
         assert!(shows(&desktop, "100 / 2000 input tokens"));
         Ok(())
     }
@@ -382,12 +384,10 @@ mod chat_layout_tests {
         configure_theme(&context);
         context.options_mut(|options| options.warn_on_id_clash = true);
 
-        let mut config = Config {
-            model_provider: Some(Provider::LlamaCpp),
-            model_url: "http://127.0.0.1:1".into(),
-            model_name: "fixture".into(),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.models.local.provider = Some(Provider::LlamaCpp);
+        config.models.local.url = "http://127.0.0.1:1".into();
+        config.models.local.name = "fixture".into();
         config.add_skill(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-notes"))?;
         config
             .skills
@@ -842,6 +842,11 @@ struct PickerCatalog {
     warnings: Vec<String>,
 }
 
+struct FallbackCheck {
+    index: usize,
+    result: Lookup<Option<FallbackMetadata>>,
+}
+
 #[derive(Clone)]
 enum PickerChoice {
     Skill(String),
@@ -876,9 +881,15 @@ struct Desktop {
     discovery_connection: Option<Connection>,
     discovery_model: String,
     models: Lookup<Vec<String>>,
+    models_source: Option<(ModelMode, Connection)>,
+    models_draft: ModelSettings,
     capabilities: Lookup<ModelCapabilities>,
     thinking_setting: Option<ThinkingSetting>,
     context_usage: Option<TokenUsage>,
+    switched_model: Option<(Provider, Option<u64>)>,
+    fallback_draft: FallbackSettings,
+    fallback_check: Option<FallbackCheck>,
+    model_cooldowns: Arc<ModelCooldowns>,
     history: ChatHistory,
     markdown_cache: CommonMarkCache,
     chat_store: Option<ChatStore>,
@@ -987,10 +998,19 @@ impl Desktop {
         Ok(Self {
             logo: None,
             runtime: tokio::runtime::Runtime::new()?,
-            settings: config.model_name.trim().is_empty() || config.model_connection().is_err(),
+            settings: config
+                .models
+                .profile(config.models.mode)
+                .name
+                .trim()
+                .is_empty()
+                || config.model_connection().is_err(),
             workspace: config.workspace.display().to_string(),
             config_error: !notice.is_empty(),
             auto_approve_tools_draft: config.auto_approve_tools,
+            fallback_draft: config.model_fallbacks.clone(),
+            models_draft: config.models.clone(),
+            fallback_check: None,
             config,
             discovery_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -998,9 +1018,12 @@ impl Desktop {
             discovery_connection: None,
             discovery_model: String::new(),
             models: Lookup::Idle,
+            models_source: None,
             capabilities: Lookup::Idle,
             thinking_setting: None,
             context_usage: None,
+            switched_model: None,
+            model_cooldowns: Arc::default(),
             events,
             sender,
             diagnostics: None,
@@ -1037,7 +1060,15 @@ impl Desktop {
         if self.busy || self.prompt.trim().is_empty() || self.active_chat_is_archived() {
             return;
         }
-        if self.config.model_connection().is_err() || self.config.model_name.trim().is_empty() {
+        if self.config.model_connection().is_err()
+            || self
+                .config
+                .models
+                .profile(self.config.models.mode)
+                .name
+                .trim()
+                .is_empty()
+        {
             self.settings = true;
             self.notice = "Choose a provider, enter its server URL, and select a model.".into();
             return;
@@ -1051,6 +1082,9 @@ impl Desktop {
         });
         self.tool_progress = None;
         self.connection_errors.clear();
+        if self.switched_model.take().is_some() {
+            self.context_usage = None;
+        }
         self.busy = true;
         self.history.push("user", std::mem::take(&mut self.prompt));
         self.chat_dirty = true;
@@ -1058,6 +1092,7 @@ impl Desktop {
         let config = self.config.clone();
         let history = self.history.messages().to_vec();
         let thinking = self.thinking_setting.clone();
+        let cooldowns = self.model_cooldowns.clone();
         let sender = self.sender.clone();
         let trace = diagnostics::Trace::new(self.diagnostics.clone());
         let context = context.clone();
@@ -1066,7 +1101,10 @@ impl Desktop {
                 let _ = sender.send(event);
                 context.request_repaint();
             };
-            let result = agent::chat(config, history, thinking, selection, &trace, emit).await;
+            let result = agent::chat(
+                config, history, thinking, selection, &cooldowns, &trace, emit,
+            )
+            .await;
             trace.record(
                 "turn_finished",
                 || serde_json::json!({"reply_returned": result.is_ok()}),
@@ -1344,6 +1382,7 @@ impl Desktop {
         self.history = history;
         self.loaded_skills.clear();
         self.context_usage = None;
+        self.switched_model = None;
         self.status = ChatStatus::Idle;
         self.tool_progress = None;
         self.connection_errors.clear();
@@ -1436,6 +1475,16 @@ impl Desktop {
         let result = (|| -> anyhow::Result<()> {
             let mut saved = self.config.clone();
             saved.auto_approve_tools = self.auto_approve_tools_draft;
+            saved.models = self.models_draft.clone();
+            if saved.models.mode == ModelMode::OpenAiCompatible {
+                self.fallback_draft.validate()?;
+                saved.models.connection(ModelMode::OpenAiCompatible)?;
+                anyhow::ensure!(
+                    !saved.models.openai.name.trim().is_empty(),
+                    "Enter the OpenAI-compatible model ID"
+                );
+            }
+            saved.model_fallbacks = self.fallback_draft.clone();
             let workspace = self.workspace.trim();
             if !workspace.is_empty() {
                 let path = Path::new(workspace);
@@ -1585,72 +1634,100 @@ impl Desktop {
 
     fn sync_discovery(&mut self) {
         let connection = self.config.model_connection().ok();
-        let model = self.config.model_name.trim();
+        let model = self
+            .config
+            .models
+            .profile(self.config.models.mode)
+            .name
+            .trim();
         if self.discovery_connection != connection {
             self.discovery_connection = connection;
-            self.models = Lookup::Idle;
             self.capabilities = Lookup::Idle;
             self.thinking_setting = None;
             self.context_usage = None;
+            self.switched_model = None;
         }
         if self.discovery_model != model {
             self.discovery_model = model.to_owned();
             self.capabilities = Lookup::Idle;
             self.thinking_setting = None;
             self.context_usage = None;
+            self.switched_model = None;
         }
     }
 
-    fn model_settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("Provider");
-        let previous_provider = self.config.model_provider;
-        let previous_url = self.config.model_url.clone();
-        let previous_model = self.config.model_name.clone();
-        let provider_label = previous_provider.map_or("Choose a provider", Provider::label);
-        egui::ComboBox::from_id_salt("model_provider")
-            .selected_text(provider_label)
-            .show_ui(ui, |ui| {
-                for provider in Provider::ALL {
-                    ui.selectable_value(
-                        &mut self.config.model_provider,
-                        Some(provider),
-                        provider.label(),
-                    );
-                }
-            });
-        let Some(provider) = self.config.model_provider else {
-            return;
+    fn model_settings_ui(&mut self, ui: &mut egui::Ui, mode: ModelMode) {
+        let profile = match mode {
+            ModelMode::LocalOnly => &mut self.models_draft.local,
+            ModelMode::OpenAiCompatible => &mut self.models_draft.openai,
         };
-        if Some(provider) != previous_provider {
-            self.config.model_name.clear();
+        let previous_provider = profile.provider;
+        let previous_url = profile.url.clone();
+        let previous_model = profile.name.clone();
+        if mode == ModelMode::LocalOnly {
+            ui.label("Runtime");
+            let provider_label = previous_provider.map_or("Choose a runtime", Provider::label);
+            egui::ComboBox::from_id_salt("model_provider")
+                .selected_text(provider_label)
+                .show_ui(ui, |ui| {
+                    for provider in [Provider::LlamaCpp, Provider::Ollama] {
+                        ui.selectable_value(
+                            &mut profile.provider,
+                            Some(provider),
+                            provider.label(),
+                        );
+                    }
+                });
+            if profile.provider != previous_provider {
+                profile.name.clear();
+            }
         }
-        let hint = if provider == Provider::OpenAiCompatible {
-            "OpenAI-compatible base URL"
+        let (provider, hint) = if mode == ModelMode::OpenAiCompatible {
+            (
+                Some(Provider::OpenAiCompatible),
+                "https://provider.example/v1",
+            )
         } else {
-            "Server address including scheme and port"
+            let hint = if profile.provider == Some(Provider::Ollama) {
+                "http://localhost:11434"
+            } else {
+                "http://localhost:8080"
+            };
+            (profile.provider, hint)
         };
-        field(ui, "Server URL", &mut self.config.model_url, hint);
+        field(ui, "Server URL", &mut profile.url, hint);
         field(
             ui,
             "Model token environment variable",
-            &mut self.config.model_token_env,
+            &mut profile.token_env,
             "Optional",
         );
-        self.sync_discovery();
-        if let Some(connection) = self.discovery_connection.clone()
+        let connection = provider
+            .and_then(|provider| Connection::new(provider, &profile.url, &profile.token_env).ok());
+        let matches_catalog = connection.as_ref().is_some_and(|connection| {
+            self.models_source
+                .as_ref()
+                .is_some_and(|(source_mode, source)| *source_mode == mode && source == connection)
+        });
+        if let Some(connection) = connection
             && ui
                 .add_enabled(
-                    !matches!(self.models, Lookup::Loading(_)),
+                    !matches_catalog || !matches!(self.models, Lookup::Loading(_)),
                     egui::Button::new("Load models"),
                 )
                 .clicked()
         {
             let client = self.discovery_client.clone();
+            self.models_source = Some((mode, connection.clone()));
             self.models.start(&self.runtime, ui.ctx(), async move {
                 connection.models(&client).await
             });
         }
-        match &self.models {
+        match if matches_catalog {
+            &self.models
+        } else {
+            &Lookup::Idle
+        } {
             Lookup::Idle => {}
             Lookup::Loading(_) => {
                 ui.label("Loading models…");
@@ -1659,7 +1736,7 @@ impl Desktop {
                 ui.label("This server returned no models.");
             }
             Lookup::Complete(Ok(models)) => {
-                let model_name = &mut self.config.model_name;
+                let model_name = &mut profile.name;
                 egui::ComboBox::from_id_salt("available_models")
                     .selected_text(if model_name.is_empty() {
                         "Choose a model"
@@ -1682,29 +1759,160 @@ impl Desktop {
         field(
             ui,
             "Model name",
-            &mut self.config.model_name,
+            &mut profile.name,
             "Select from the list or enter a model name",
         );
-        if self.config.model_provider != previous_provider
-            || self.config.model_url.trim() != previous_url.trim()
-            || self.config.model_name.trim() != previous_model.trim()
+        if profile.provider != previous_provider
+            || profile.url.trim() != previous_url.trim()
+            || profile.name.trim() != previous_model.trim()
         {
-            self.config.model_context_limit = 0;
+            profile.context_limit = 0;
         }
-        if provider != Provider::LlamaCpp {
+        if provider != Some(Provider::LlamaCpp) {
             ui.horizontal(|ui| {
                 ui.label("Context limit (input tokens)");
-                ui.add(
-                    egui::DragValue::new(&mut self.config.model_context_limit).range(0..=u32::MAX),
-                )
-                .on_hover_text("Set to 0 to use the model's reported limit.");
+                ui.add(egui::DragValue::new(&mut profile.context_limit).range(0..=u32::MAX))
+                    .on_hover_text("Set to 0 to use the model's reported limit.");
             });
+        }
+    }
+
+    fn fallback_settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.checkbox(
+            &mut self.fallback_draft.enabled,
+            "Try other free models automatically",
+        );
+        if !self.fallback_draft.enabled {
+            return;
+        }
+        ui.label("Pluto tries these servers in order and sends the current chat and tool results to the server it selects.");
+        let mut remove = None;
+        for (index, entry) in self.fallback_draft.models.iter_mut().enumerate() {
+            ui.push_id(index, |ui| {
+                ui.group(|ui| {
+                    let url = field(
+                        ui,
+                        "Fallback API base URL",
+                        &mut entry.url,
+                        "https://provider.example/v1",
+                    );
+                    let model = field(
+                        ui,
+                        "Model ID",
+                        &mut entry.model,
+                        "Copy the exact ID from the provider",
+                    );
+                    let token = field(
+                        ui,
+                        "Token environment variable",
+                        &mut entry.token_env,
+                        "Optional",
+                    );
+                    if url.changed() || model.changed() {
+                        entry.free_open = false;
+                        entry.verified_tools = false;
+                        entry.context_limit = 0;
+                    }
+                    if (url.changed() || model.changed() || token.changed())
+                        && self
+                            .fallback_check
+                            .as_ref()
+                            .is_some_and(|check| check.index == index)
+                    {
+                        self.fallback_check = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            !entry.model.trim().is_empty(),
+                            egui::Button::new("Check model metadata"),
+                        )
+                        .clicked()
+                    {
+                        let mut result = Lookup::Idle;
+                        match entry.connection() {
+                            Ok(connection) => {
+                                let client = self.discovery_client.clone();
+                                let model = entry.model.trim().to_owned();
+                                result.start(&self.runtime, ui.ctx(), async move {
+                                    connection.fallback_metadata(&client, &model).await
+                                });
+                            }
+                            Err(error) => result = Lookup::Complete(Err(error)),
+                        }
+                        self.fallback_check = Some(FallbackCheck { index, result });
+                    }
+                    if let Some(check) = self
+                        .fallback_check
+                        .as_ref()
+                        .filter(|check| check.index == index)
+                    {
+                        match &check.result {
+                            Lookup::Loading(_) => {
+                                ui.label("Checking the provider catalog…");
+                            }
+                            Lookup::Complete(Ok(Some(metadata))) => {
+                                let limit = metadata.context_window.map_or_else(
+                                    || "unknown".into(),
+                                    |limit| format!("{limit} tokens"),
+                                );
+                                let tools = match metadata.supports_tools {
+                                    Some(true) => "supported",
+                                    Some(false) => "unsupported",
+                                    None => "unknown",
+                                };
+                                ui.label(format!("Context · {limit}    Tool calls · {tools}"));
+                                if metadata.paid {
+                                    ui.label("The provider lists a price for this model.");
+                                }
+                            }
+                            Lookup::Complete(Ok(None)) => {
+                                ui.label("The provider catalog has no metadata for this model ID.");
+                            }
+                            Lookup::Complete(Err(error)) => {
+                                ui.label(format!("Could not check model metadata: {error:#}"));
+                            }
+                            Lookup::Idle => {}
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Context limit");
+                        ui.add(egui::DragValue::new(&mut entry.context_limit))
+                            .on_hover_text("0 reads the limit from the provider catalog.");
+                    });
+                    ui.checkbox(
+                        &mut entry.verified_tools,
+                        "I verified tool support if the catalog omits it",
+                    );
+                    ui.checkbox(
+                        &mut entry.free_open,
+                        "I verified this model is free and openly licensed",
+                    );
+                    if ui.small_button("Remove fallback").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = remove {
+            self.fallback_draft.models.remove(index);
+            self.fallback_check = None;
+        }
+        if self.fallback_draft.models.len() < MAX_FALLBACK_MODELS
+            && ui.small_button("Add fallback model").clicked()
+        {
+            self.fallback_draft.models.push(Default::default());
         }
     }
 
     fn chat_heading(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Chat");
+            ui.label(
+                RichText::new(self.config.models.mode.label())
+                    .small()
+                    .weak(),
+            );
             let Some(connection) = self.discovery_connection.clone() else {
                 return;
             };
@@ -1712,7 +1920,8 @@ impl Desktop {
                 return;
             }
             if connection.provider == Provider::OpenAiCompatible {
-                if self.config.model_context_limit == 0 && matches!(self.capabilities, Lookup::Idle)
+                if self.config.models.openai.context_limit == 0
+                    && matches!(self.capabilities, Lookup::Idle)
                 {
                     self.start_capabilities_lookup(ui, connection);
                 }
@@ -1786,9 +1995,23 @@ impl Desktop {
             Lookup::Complete(Ok(capabilities)) => capabilities.context_window,
             _ => None,
         };
-        let input_only = self.config.model_provider != Some(Provider::LlamaCpp);
-        let override_limit = self.config.model_context_limit;
-        let window = if input_only && override_limit > 0 {
+        let provider = self
+            .switched_model
+            .map(|(provider, _)| provider)
+            .or_else(|| {
+                self.discovery_connection
+                    .as_ref()
+                    .map(|connection| connection.provider)
+            });
+        let input_only = provider != Some(Provider::LlamaCpp);
+        let override_limit = self
+            .config
+            .models
+            .profile(self.config.models.mode)
+            .context_limit;
+        let window = if let Some((_, context_window)) = self.switched_model {
+            context_window
+        } else if input_only && override_limit > 0 {
             Some(u64::from(override_limit))
         } else {
             reported_window
@@ -1920,7 +2143,23 @@ impl Desktop {
         }
         ui.separator();
         ui.heading("Model and workspace");
-        self.model_settings_ui(ui);
+        ui.horizontal_wrapped(|ui| {
+            for mode in [ModelMode::LocalOnly, ModelMode::OpenAiCompatible] {
+                ui.radio_value(&mut self.models_draft.mode, mode, mode.label());
+            }
+        });
+        egui::CollapsingHeader::new("Local model")
+            .default_open(self.models_draft.mode == ModelMode::LocalOnly)
+            .show(ui, |ui| self.model_settings_ui(ui, ModelMode::LocalOnly));
+        egui::CollapsingHeader::new("OpenAI-compatible model")
+            .default_open(self.models_draft.mode == ModelMode::OpenAiCompatible)
+            .show(ui, |ui| {
+                self.model_settings_ui(ui, ModelMode::OpenAiCompatible);
+                ui.label(
+                    "Pluto uses the saved local model when the configured cloud options fail.",
+                );
+                self.fallback_settings_ui(ui);
+            });
         field(
             ui,
             "Terminal working directory",
@@ -2072,19 +2311,22 @@ impl Desktop {
     }
 }
 
-fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> egui::Response {
     ui.label(label);
     ui.add(
         TextEdit::singleline(value)
             .hint_text(hint)
             .desired_width(f32::INFINITY),
-    );
+    )
 }
 
 impl eframe::App for Desktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.models.poll();
         self.capabilities.poll();
+        if let Some(check) = &mut self.fallback_check {
+            check.result.poll();
+        }
         self.picker_catalog.poll();
         if let Some(test) = &mut self.mcp_test {
             test.result.poll();
@@ -2098,6 +2340,19 @@ impl eframe::App for Desktop {
                 }
                 Event::ModelRequestFailed(error, retry) => {
                     self.status = ChatStatus::ModelRequestFailed(error, retry);
+                }
+                Event::ModelSwitched {
+                    model,
+                    origin,
+                    provider,
+                    context_window,
+                } => {
+                    self.switched_model = Some((provider, context_window));
+                    self.context_usage = None;
+                    self.connection_errors.push(format!(
+                        "Switched to {model} via {} at {origin}",
+                        provider.label()
+                    ));
                 }
                 Event::Tool(tool) => self.tool_progress = Some(tool),
                 Event::SkillLoaded(name) => {
@@ -2126,8 +2381,9 @@ impl eframe::App for Desktop {
                     connection,
                     model,
                     tokens,
-                } if self.discovery_connection.as_ref() == Some(&connection)
-                    && self.discovery_model == model =>
+                } if self.switched_model.is_some()
+                    || (self.discovery_connection.as_ref() == Some(&connection)
+                        && self.discovery_model == model) =>
                 {
                     self.context_usage = tokens;
                 }

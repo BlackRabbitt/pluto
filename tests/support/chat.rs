@@ -1,7 +1,10 @@
 use crate::agent::{self, ApprovalDecision, Event, TokenUsage, ToolPhase, TurnSelection};
 use crate::diagnostics::Trace;
+use crate::model_fallback::{FallbackModel, FallbackSettings, ModelCooldowns};
 use crate::providers::{Connection, Provider, ThinkingSetting};
-use crate::tools::{ApprovalRule, Config, Mcp, McpToolId, ToolSet};
+use crate::tools::{
+    ApprovalRule, Config, Mcp, McpToolId, ModelMode, ModelProfile, ModelSettings, ToolSet,
+};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -9,6 +12,27 @@ use std::{fs, path::Path, process::Stdio};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::process::Command;
+
+fn model_settings(provider: Provider, url: String, name: String) -> ModelSettings {
+    let profile = ModelProfile {
+        provider: Some(provider),
+        url,
+        name,
+        ..Default::default()
+    };
+    if provider == Provider::OpenAiCompatible {
+        ModelSettings {
+            mode: ModelMode::OpenAiCompatible,
+            openai: profile,
+            ..Default::default()
+        }
+    } else {
+        ModelSettings {
+            local: profile,
+            ..Default::default()
+        }
+    }
+}
 
 async fn chat(
     config: Config,
@@ -22,6 +46,7 @@ async fn chat(
         history,
         thinking,
         selection,
+        &ModelCooldowns::default(),
         &Trace::default(),
         emit,
     )
@@ -54,9 +79,11 @@ async fn global_auto_approval_runs_and_tracks_terminal_and_mcp_calls() -> Result
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;
     let mut config = Config {
-        model_provider: Some(Provider::OpenAiCompatible),
-        model_url: format!("http://127.0.0.1:{port}/v1"),
-        model_name: "global-approval-fixture".into(),
+        models: model_settings(
+            Provider::OpenAiCompatible,
+            format!("http://127.0.0.1:{port}/v1"),
+            "global-approval-fixture".into(),
+        ),
         auto_approve_tools: true,
         ..Config::default()
     };
@@ -75,6 +102,7 @@ async fn global_auto_approval_runs_and_tracks_terminal_and_mcp_calls() -> Result
         vec![("user".into(), "Run the fixture".into())],
         None,
         TurnSelection::default(),
+        &ModelCooldowns::default(),
         &trace,
         |event| match event {
             Event::Approve(..) => panic!("Global auto-approval must not open a confirmation"),
@@ -112,9 +140,11 @@ async fn retry_model_call_after_503_reuses_tool_result() -> Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;
     let config = Config {
-        model_provider: Some(Provider::OpenAiCompatible),
-        model_url: format!("http://127.0.0.1:{port}/v1"),
-        model_name: "model-retry-fixture".into(),
+        models: model_settings(
+            Provider::OpenAiCompatible,
+            format!("http://127.0.0.1:{port}/v1"),
+            "model-retry-fixture".into(),
+        ),
         ..Config::default()
     };
     let (log, entries) = std::sync::mpsc::sync_channel(64);
@@ -125,6 +155,7 @@ async fn retry_model_call_after_503_reuses_tool_result() -> Result<()> {
         vec![("user".into(), "Run the fixture".into())],
         None,
         TurnSelection::default(),
+        &ModelCooldowns::default(),
         &trace,
         |event| match event {
             Event::Approve(_, decision) => {
@@ -156,6 +187,157 @@ async fn retry_model_call_after_503_reuses_tool_result() -> Result<()> {
 }
 
 #[tokio::test]
+async fn rate_limit_fallback_matches_metadata_and_reuses_tool_results() -> Result<()> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
+    let (_primary, primary_port) = http_fixture(&script).await?;
+    let (_fallback, fallback_port) = http_fixture(&script).await?;
+    let mut config = Config {
+        models: model_settings(
+            Provider::OpenAiCompatible,
+            format!("http://127.0.0.1:{primary_port}/v1"),
+            "rate-limited-fixture".into(),
+        ),
+        model_fallbacks: FallbackSettings {
+            enabled: false,
+            models: [
+                "fallback-paid",
+                "fallback-small",
+                "fallback-no-tools",
+                "fallback-ready",
+            ]
+            .into_iter()
+            .map(|model| FallbackModel {
+                url: format!("http://127.0.0.1:{fallback_port}/fallback/v1"),
+                model: model.into(),
+                free_open: true,
+                ..Default::default()
+            })
+            .collect(),
+        },
+        ..Config::default()
+    };
+    let cooldowns = ModelCooldowns::default();
+    for enabled in [false, true] {
+        config.model_fallbacks.enabled = enabled;
+        let approvals = std::cell::Cell::new(0);
+        let switches = std::cell::Cell::new(0);
+        let result = agent::chat(
+            config.clone(),
+            vec![("user".into(), "Run the fixture".into())],
+            Some(ThinkingSetting::Effort("high".into())),
+            TurnSelection::default(),
+            &cooldowns,
+            &Trace::default(),
+            |event| match event {
+                Event::Approve(_, reply) => {
+                    approvals.set(approvals.get() + 1);
+                    let _ = reply.send(ApprovalDecision::RunOnce);
+                }
+                Event::ModelSwitched {
+                    model,
+                    context_window,
+                    ..
+                } => {
+                    assert_eq!(model, "fallback-ready");
+                    assert_eq!(context_window, Some(32768));
+                    switches.set(switches.get() + 1);
+                }
+                _ => {}
+            },
+        )
+        .await;
+        assert_eq!(approvals.get(), 1);
+        assert_eq!(switches.get(), usize::from(enabled));
+        if enabled {
+            assert_eq!(result?, "Reused the tool result");
+        } else {
+            assert!(format!("{:#}", result.unwrap_err()).contains("429"));
+        }
+        assert_eq!(cooldowns.active(&config.model_connection()?), enabled);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn model_modes_use_the_expected_fallback_order() -> Result<()> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
+    let (_primary, primary_port) = http_fixture(&script).await?;
+    let (_backup, backup_port) = http_fixture(&script).await?;
+    let (_local, local_port) = http_fixture(&script).await?;
+    let mut config = Config {
+        models: ModelSettings {
+            openai: ModelProfile {
+                url: format!("http://127.0.0.1:{primary_port}/v1"),
+                name: "rate-limited-fixture".into(),
+                ..Default::default()
+            },
+            local: ModelProfile {
+                provider: Some(Provider::LlamaCpp),
+                url: format!("http://127.0.0.1:{local_port}"),
+                name: "local-rate-limited".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        model_fallbacks: FallbackSettings {
+            enabled: true,
+            models: vec![FallbackModel {
+                url: format!("http://127.0.0.1:{backup_port}/fallback/v1"),
+                model: "fallback-quota".into(),
+                free_open: true,
+                ..Default::default()
+            }],
+        },
+        ..Default::default()
+    };
+    for (mode, backup_enabled) in [
+        (ModelMode::LocalOnly, true),
+        (ModelMode::OpenAiCompatible, true),
+        (ModelMode::OpenAiCompatible, false),
+    ] {
+        config.models.mode = mode;
+        config.model_fallbacks.enabled = backup_enabled;
+        if mode == ModelMode::OpenAiCompatible {
+            config.models.local.name = "local-resume".into();
+        }
+        let approvals = std::cell::Cell::new(0);
+        let switches = std::cell::RefCell::new(Vec::new());
+        let result = chat(
+            config.clone(),
+            vec![("user".into(), "Run the fixture".into())],
+            None,
+            TurnSelection::default(),
+            |event| match event {
+                Event::Approve(_, reply) => {
+                    approvals.set(approvals.get() + 1);
+                    let _ = reply.send(ApprovalDecision::RunOnce);
+                }
+                Event::ModelSwitched { model, .. } => switches.borrow_mut().push(model),
+                _ => {}
+            },
+        )
+        .await;
+        assert_eq!(approvals.get(), 1);
+        let switches = switches.into_inner();
+        match (mode, backup_enabled) {
+            (ModelMode::LocalOnly, _) => {
+                assert!(result.unwrap_err().to_string().contains("429"));
+                assert!(switches.is_empty());
+            }
+            (ModelMode::OpenAiCompatible, true) => {
+                assert_eq!(result?, "Reused the tool result");
+                assert_eq!(switches, ["fallback-quota", "local-resume"]);
+            }
+            (ModelMode::OpenAiCompatible, false) => {
+                assert_eq!(result?, "Reused the tool result");
+                assert_eq!(switches, ["local-resume"]);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn chat_enforces_the_tool_call_limit() -> Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;
@@ -171,9 +353,11 @@ async fn chat_enforces_the_tool_call_limit() -> Result<()> {
         ),
     ] {
         let config = Config {
-            model_provider: Some(Provider::OpenAiCompatible),
-            model_url: format!("http://127.0.0.1:{port}/v1"),
-            model_name: model.into(),
+            models: model_settings(
+                Provider::OpenAiCompatible,
+                format!("http://127.0.0.1:{port}/v1"),
+                model.into(),
+            ),
             ..Config::default()
         };
         let calls = std::cell::Cell::new(0);
@@ -184,6 +368,7 @@ async fn chat_enforces_the_tool_call_limit() -> Result<()> {
             vec![("user".into(), "Run the fixture".into())],
             None,
             TurnSelection::default(),
+            &ModelCooldowns::default(),
             &trace,
             |event| match event {
                 Event::Tool(tool)
@@ -285,9 +470,11 @@ async fn provider_metadata_controls_chat_reasoning() -> Result<()> {
         ),
     ] {
         let config = Config {
-            model_provider: Some(provider),
-            model_url: format!("http://127.0.0.1:{port}/v1/"),
-            model_name: model.into(),
+            models: model_settings(
+                provider,
+                format!("http://127.0.0.1:{port}/v1/"),
+                model.into(),
+            ),
             ..Config::default()
         };
         let connection = config.model_connection()?;
@@ -345,9 +532,11 @@ async fn llama_template_can_expose_a_thinking_switch_without_named_levels() -> R
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;
     let config = Config {
-        model_provider: Some(Provider::LlamaCpp),
-        model_url: format!("http://127.0.0.1:{port}"),
-        model_name: "toggle fixture".into(),
+        models: model_settings(
+            Provider::LlamaCpp,
+            format!("http://127.0.0.1:{port}"),
+            "toggle fixture".into(),
+        ),
         ..Config::default()
     };
     let client = reqwest::Client::builder()
@@ -355,7 +544,7 @@ async fn llama_template_can_expose_a_thinking_switch_without_named_levels() -> R
         .build()?;
     let connection = config.model_connection()?;
     let levels = connection
-        .capabilities(&client, &config.model_name)
+        .capabilities(&client, &config.models.profile(config.models.mode).name)
         .await?
         .thinking?;
     assert_eq!(levels.len(), 2);
@@ -424,14 +613,17 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
         fs::create_dir_all(workspace.join("tests/test-notes"))?;
         fs::copy(example.join("notes.py"), scratch_cli)?;
         let mut config = Config {
-            model_provider: Some(Provider::OpenAiCompatible),
-            model_name: "picked-skill-fixture".into(),
+            models: model_settings(
+                Provider::OpenAiCompatible,
+                String::new(),
+                "picked-skill-fixture".into(),
+            ),
             workspace: workspace.clone(),
             ..Config::default()
         };
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
         let (_http, port) = http_fixture(&fixture).await?;
-        config.model_url = format!("http://127.0.0.1:{port}/v1");
+        config.models.openai.url = format!("http://127.0.0.1:{port}/v1");
         let name = config.add_skill(&example)?;
         assert_eq!(name, "test-notes");
         let summary_skill = workspace.join("summary");
@@ -499,9 +691,11 @@ async fn find_tools_exposes_fixture_schemas_on_demand() -> Result<()> {
         token_env: String::new(),
     };
     let mut config = Config {
-        model_provider: Some(Provider::OpenAiCompatible),
-        model_url: format!("http://127.0.0.1:{port}/v1"),
-        model_name: "find-tools-fixture".into(),
+        models: model_settings(
+            Provider::OpenAiCompatible,
+            format!("http://127.0.0.1:{port}/v1"),
+            "find-tools-fixture".into(),
+        ),
         mcp: ["secondary", "extra-a", "extra-b"]
             .into_iter()
             .map(|name| (name.to_owned(), other_server.clone()))
@@ -546,7 +740,7 @@ async fn find_tools_exposes_fixture_schemas_on_demand() -> Result<()> {
     });
     assert!(selected.iter().all(|tool| choices.contains(tool)));
     drop(tools);
-    config.model_name = "picked-mcp-fixture".into();
+    config.models.openai.name = "picked-mcp-fixture".into();
     let selected_approvals = std::cell::RefCell::new(Vec::new());
     let result = chat(
         config,
@@ -592,9 +786,11 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
     )?;
 
     let mut config = Config {
-        model_provider: Some(Provider::OpenAiCompatible),
-        model_url: format!("http://127.0.0.1:{port}/v1"),
-        model_name: "fixture".into(),
+        models: model_settings(
+            Provider::OpenAiCompatible,
+            format!("http://127.0.0.1:{port}/v1"),
+            "fixture".into(),
+        ),
         ..Config::default()
     };
     config.add_skill(&skill_file)?;

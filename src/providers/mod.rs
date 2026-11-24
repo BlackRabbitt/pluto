@@ -17,8 +17,6 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Self; 3] = [Self::LlamaCpp, Self::Ollama, Self::OpenAiCompatible];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::LlamaCpp => "llama.cpp",
@@ -36,6 +34,13 @@ pub struct ThinkingLevel {
 pub struct ModelCapabilities {
     pub thinking: Result<Vec<ThinkingLevel>>,
     pub context_window: Option<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct FallbackMetadata {
+    pub context_window: Option<u64>,
+    pub supports_tools: Option<bool>,
+    pub paid: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +66,10 @@ pub struct Connection {
 }
 
 impl Connection {
+    pub fn origin(&self) -> String {
+        self.base_url.origin().ascii_serialization()
+    }
+
     pub fn new(provider: Provider, base_url: &str, token_env: &str) -> Result<Self> {
         let mut base_url = Url::parse(base_url.trim()).context("Enter a server URL")?;
         ensure!(
@@ -133,6 +142,26 @@ impl Connection {
         }
     }
 
+    pub async fn fallback_metadata(
+        &self,
+        client: &Client,
+        model: &str,
+    ) -> Result<Option<FallbackMetadata>> {
+        Ok(self
+            .fallback_catalog(client, &[model])
+            .await?
+            .pop()
+            .flatten())
+    }
+
+    pub async fn fallback_catalog(
+        &self,
+        client: &Client,
+        models: &[&str],
+    ) -> Result<Vec<Option<FallbackMetadata>>> {
+        openai_compatible::fallback_catalog(self, client, models).await
+    }
+
     pub fn chat_request(
         &self,
         client: &Client,
@@ -145,22 +174,33 @@ impl Connection {
             Provider::OpenAiCompatible => "chat/completions",
             _ => "v1/chat/completions",
         };
-        let mut body = json!({
-            "model": model,
-            "messages": messages,
-            "stream": false
-        });
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
+        #[derive(Serialize)]
+        struct ChatBody<'a> {
+            model: &'a str,
+            messages: &'a [Value],
+            stream: bool,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            tools: &'a [Value],
+            #[serde(flatten)]
+            options: Value,
         }
+        let mut options = json!({});
         match thinking {
-            Some(ThinkingSetting::Effort(effort)) => body["reasoning_effort"] = json!(effort),
-            Some(ThinkingSetting::Toggle(enabled)) => llama_cpp::set_thinking(&mut body, *enabled),
+            Some(ThinkingSetting::Effort(effort)) => options["reasoning_effort"] = json!(effort),
+            Some(ThinkingSetting::Toggle(enabled)) => {
+                llama_cpp::set_thinking(&mut options, *enabled)
+            }
             None => {}
         }
         Ok(self
             .request(client, Method::POST, self.endpoint(route))?
-            .json(&body))
+            .json(&ChatBody {
+                model,
+                messages,
+                stream: false,
+                tools,
+                options,
+            }))
     }
 }
 

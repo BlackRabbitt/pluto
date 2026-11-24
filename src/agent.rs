@@ -1,7 +1,8 @@
 use crate::APP_NAME;
 use crate::diagnostics::Trace;
+use crate::model_fallback::{FailedModels, ModelCooldowns, context_budget, retry_after};
 use crate::providers::{Connection, Provider, ThinkingSetting};
-use crate::tools::{ApprovalRequest, Config, McpToolId, ToolActivity, ToolSet};
+use crate::tools::{ApprovalRequest, Config, McpToolId, ModelMode, ToolActivity, ToolSet};
 use anyhow::{Context, Result, ensure};
 use chrono::{Local, SecondsFormat};
 use serde_json::{Value, json};
@@ -64,6 +65,12 @@ impl ToolLimitHandoff {
 pub enum Event {
     ModelRequest(ModelPhase),
     ModelRequestFailed(String, oneshot::Sender<()>),
+    ModelSwitched {
+        model: String,
+        origin: String,
+        provider: Provider,
+        context_window: Option<u64>,
+    },
     Tool(ToolProgress),
     SkillLoaded(String),
     Warning(String),
@@ -146,11 +153,12 @@ pub async fn chat(
     history: Vec<(String, String)>,
     thinking: Option<ThinkingSetting>,
     selection: TurnSelection,
+    cooldowns: &ModelCooldowns,
     trace: &Trace,
     emit: impl Fn(Event),
 ) -> Result<String> {
-    let connection = config.model_connection()?;
-    let model = config.model_name.trim();
+    let mut connection = config.model_connection()?;
+    let mut model = config.models.profile(config.models.mode).name.trim();
     trace.record("turn_started", || json!({"provider": connection.provider.label(), "model": model, "history_messages": history.len(), "tool_limit": MAX_TOOL_CALLS_PER_TURN}));
     let catalog = config.skill_catalog();
     let discovery_started = Instant::now();
@@ -178,11 +186,30 @@ pub async fn chat(
         selected_aliases.iter().cloned().collect()
     };
     let mut definitions = tools.definitions(&active_mcp_tools);
-    let timeout = match connection.provider {
-        Provider::LlamaCpp | Provider::Ollama => Duration::from_secs(600),
-        Provider::OpenAiCompatible => Duration::from_secs(120),
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() < 10
+                && attempt
+                    .previous()
+                    .last()
+                    .is_some_and(|previous| previous.origin() == attempt.url().origin())
+            {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()?;
+    let mut failed_models = FailedModels::new();
+    let local_profile = &config.models.local;
+    let mut local_fallback = if config.models.mode == ModelMode::OpenAiCompatible
+        && !local_profile.name.trim().is_empty()
+    {
+        config.models.connection(ModelMode::LocalOnly).ok()
+    } else {
+        None
     };
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let mut thinking = thinking;
     let mut selection_prompt = String::new();
     if !selection.skills.is_empty() {
         selection_prompt.push_str("The user selected skills for this turn. Use the registered instructions included in the load_skill results to handle the request.\n");
@@ -262,9 +289,21 @@ pub async fn chat(
             ));
             trace.record("model_request", || json!({"request": request_number, "messages": messages.len(), "tools_offered": offered_tools.len(), "remaining_tool_calls": MAX_TOOL_CALLS_PER_TURN - tool_calls, "partial": finalizing}));
             let started = Instant::now();
+            let can_route = connection.provider == Provider::OpenAiCompatible
+                && (config.model_fallbacks.enabled || local_fallback.is_some());
+            let cooling = can_route && cooldowns.active(&connection);
+            let mut retry_delay = None;
             let result = async {
+                ensure!(!cooling, "Model provider is cooling down after HTTP 429");
                 let response = connection
                     .chat_request(&client, model, &messages, offered_tools, thinking.as_ref())?
+                    .timeout(Duration::from_secs(
+                        if connection.provider == Provider::OpenAiCompatible {
+                            120
+                        } else {
+                            600
+                        },
+                    ))
                     .send()
                     .await
                     .context("Could not reach the model endpoint")?;
@@ -272,6 +311,9 @@ pub async fn chat(
                     "model_http_status",
                     || json!({"request": request_number, "status": response.status().as_u16()}),
                 );
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    retry_delay = Some(retry_after(response.headers()));
+                }
                 response
                     .error_for_status_ref()
                     .map_err(reqwest::Error::without_url)?;
@@ -291,9 +333,71 @@ pub async fn chat(
                 Ok(response) => break response,
                 Err(error) => error,
             };
-            if retryable_model_error(&error) {
+            let find_fallback = can_route && (cooling || cloud_model_unavailable(&error));
+            if find_fallback {
+                let failed_model = if cooling || retry_delay.is_some() {
+                    None
+                } else {
+                    Some(model.to_owned())
+                };
+                failed_models.insert((connection.origin(), failed_model));
+                if let Some(delay) = retry_delay {
+                    cooldowns.limit(&connection, delay);
+                }
+            }
+            let cloud_fallback = if find_fallback && config.model_fallbacks.enabled {
+                config
+                    .model_fallbacks
+                    .pick(
+                        &client,
+                        cooldowns,
+                        &failed_models,
+                        context_budget(&messages, offered_tools)?,
+                        !offered_tools.is_empty()
+                            || messages.iter().any(|message| message["role"] == "tool"),
+                    )
+                    .await
+                    .map(|(connection, model, limit)| (connection, model, Some(limit)))
+            } else {
+                None
+            };
+            let fallback = cloud_fallback.or_else(|| {
+                if find_fallback {
+                    let limit = u64::from(local_profile.context_limit);
+                    local_fallback.take().map(|connection| {
+                        (
+                            connection,
+                            local_profile.name.trim(),
+                            (limit > 0).then_some(limit),
+                        )
+                    })
+                } else {
+                    None
+                }
+            });
+            if let Some((next_connection, next_model, context_window)) = fallback {
+                connection = next_connection;
+                model = next_model;
+                thinking = None;
+                trace.record(
+                    "model_fallback",
+                    || json!({"model": model, "provider": connection.provider.label(), "context_window": context_window}),
+                );
+                emit(Event::ModelSwitched {
+                    model: model.into(),
+                    origin: connection.origin(),
+                    provider: connection.provider,
+                    context_window,
+                });
+                continue;
+            }
+            if cooling || retryable_model_error(&error) {
                 let (retry, decision) = oneshot::channel();
-                emit(Event::ModelRequestFailed(format!("{error:#}"), retry));
+                let mut reason = format!("{error:#}");
+                if find_fallback {
+                    reason.push_str("\nNo configured fallback model is eligible for this request.");
+                }
+                emit(Event::ModelRequestFailed(reason, retry));
                 if decision.await.is_ok() {
                     continue;
                 }
@@ -468,6 +572,22 @@ fn retryable_model_error(error: &anyhow::Error) -> bool {
                     || status == reqwest::StatusCode::TOO_MANY_REQUESTS
             })
     })
+}
+
+fn cloud_model_unavailable(error: &anyhow::Error) -> bool {
+    retryable_model_error(error)
+        || error.downcast_ref::<std::env::VarError>().is_some()
+        || error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            matches!(
+                error.status(),
+                Some(
+                    reqwest::StatusCode::UNAUTHORIZED
+                        | reqwest::StatusCode::PAYMENT_REQUIRED
+                        | reqwest::StatusCode::FORBIDDEN
+                        | reqwest::StatusCode::NOT_FOUND
+                )
+            )
+        })
 }
 
 fn model_outcome(result: &Result<Value>) -> &'static str {

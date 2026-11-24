@@ -69,7 +69,8 @@ def model(request):
     assert abs((datetime.now(timezone.utc) - local_time).total_seconds()) < 60
     assert any(line.startswith("Local time zone: ") and line.removeprefix("Local time zone: ").strip()
                for line in system_prompt.splitlines())
-    if request["model"] == "model-retry-fixture":
+    if request["model"] in ("model-retry-fixture", "rate-limited-fixture", "fallback-ready",
+                            "local-rate-limited", "local-resume"):
         messages = request["messages"][1:]
         assert messages[0] == {"role": "user", "content": "Run the fixture"}
         if len(messages) == 1:
@@ -80,6 +81,8 @@ def model(request):
         assert result["role"] == "tool"
         assert result["tool_call_id"] == call["tool_calls"][0]["id"] == "call_0"
         assert json.loads(result["content"])["stdout"] == "retry fixture output"
+        if request["model"] == "fallback-ready":
+            assert "reasoning_effort" not in request
         return {"choices": [{"message": {"content": "Reused the tool result"}}]}
     if request["model"] == "global-approval-fixture":
         results = [item["content"] for item in request["messages"] if item["role"] == "tool"]
@@ -217,6 +220,18 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "fixture/zero", "context_length": 0},
                 {"id": "fixture/unknown"},
             ]}
+        elif parsed.path == "/fallback/v1/models":
+            assert not getattr(self.server, "fallback_catalog_read", False)
+            self.server.fallback_catalog_read = True
+            body = {"data": [
+                {"id": "fallback-paid", "context_length": 32768, "supported_parameters": ["tools"],
+                 "pricing": {"prompt": "0.001"}},
+                {"id": "fallback-small", "context_length": 1024, "supported_parameters": ["tools"]},
+                {"id": "fallback-no-tools", "context_length": 32768, "supported_parameters": ["temperature"]},
+                {"id": "fallback-ready", "context_length": 32768, "supported_parameters": ["tools"],
+                 "pricing": {"prompt": "0", "completion": "0"}},
+                {"id": "fallback-quota", "context_length": 32768, "supported_parameters": ["tools"]},
+            ]}
         elif parsed.path == "/props":
             selected = parse_qs(parsed.query)["model"]
             if selected in (["toggle fixture"], ["fixed fixture"]):
@@ -248,7 +263,15 @@ class Handler(BaseHTTPRequestHandler):
             prompt = "thinking" if enabled and payload["model"] == "toggle fixture" else "answer"
             body = {"prompt": prompt}
         else:
-            assert self.path == "/v1/chat/completions"
+            assert self.path in ("/v1/chat/completions", "/fallback/v1/chat/completions")
+            if self.path == "/fallback/v1/chat/completions":
+                assert payload["model"] in ("fallback-ready", "fallback-quota")
+            if (payload["model"] in ("rate-limited-fixture", "fallback-quota", "local-rate-limited")
+                    and payload["messages"][-1]["role"] == "tool"):
+                self.send_response(429)
+                self.send_header("Retry-After", "0" if payload["model"] == "fallback-quota" else "120")
+                self.end_headers()
+                return
             body = model(payload)
             if payload["model"] == "model-retry-fixture" and payload["messages"][-1]["role"] == "tool":
                 retry_request = {**payload, "messages": payload["messages"][1:]}
