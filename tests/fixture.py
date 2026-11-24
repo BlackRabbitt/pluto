@@ -93,41 +93,71 @@ def model(request):
         assert len(results) == 2 and "fixture lookup succeeded" in results[1]
         return {"choices": [{"message": {"content": "Global approval fixture passed"}}]}
     if request["model"].startswith("tool-limit-"):
+        limit = 128
+        if len(request["messages"]) >= 4 and request["messages"][3]["content"] == "Continue":
+            assert request["model"] == "tool-limit-overflow-fixture"
+            assert request["messages"][1]["content"] == "Run the fixture"
+            handoff = request["messages"][2]
+            assert handoff["role"] == "assistant"
+            assert "skipped the entire pending batch of 2 calls" in handoff["content"]
+            assert "**Next step** · Print `pending-marker`." in handoff["content"]
+            if len(request["messages"]) == 4:
+                return tool_call(0, "terminal", {"command": "printf", "args": ["%s", "pending-marker"]})
+            assert len(request["messages"]) == 6
+            assert json.loads(request["messages"][-1]["content"])["stdout"] == "pending-marker"
+            return {"choices": [{"message": {"content": "Resumed from the handoff"}}]}
         count = sum(item["role"] == "tool" for item in request["messages"])
         if "tools" not in request:
-            assert request["model"] != "tool-limit-fixture" and count == 52
-            assert "Give a partial answer" in request["messages"][0]["content"]
+            assert request["model"] != "tool-limit-fixture" and count == limit
+            assert "Give a partial answer" in system_prompt
+            assert all(heading in system_prompt for heading in ("**Completed**", "**Stopped at**", "**Next step**"))
+            assert "pending-marker" in system_prompt
             if request["model"] == "tool-limit-no-summary-fixture":
                 return tool_call(count, "find_tools", {"query": "ignored"})
-            return {"choices": [{"message": {"content": "Summary of the 52 completed requests"}}]}
-        if count == 52 and request["model"] == "tool-limit-fixture":
-            return {"choices": [{"message": {"content": "52 tool calls completed"}}]}
+            summary = (f"**Completed** · Summary of the {limit} completed requests.\n\n"
+                       "**Stopped at** · The marker has not been printed.\n\n"
+                       "**Next step** · Print `pending-marker`.")
+            return {"choices": [{"message": {"content": summary}}]}
+        if count == limit and request["model"] == "tool-limit-fixture":
+            return {"choices": [{"message": {"content": f"{limit} tool calls completed"}}]}
         reply = tool_call(count, "find_tools", {"query": "fixture"})
-        second = tool_call(count + 1, "find_tools", {"query": "fixture"})
+        second = (tool_call(count + 1, "terminal", {"command": "printf", "args": ["%s", "pending-marker"]})
+                  if count == limit else tool_call(count + 1, "find_tools", {"query": "fixture"}))
         reply["choices"][0]["message"]["tool_calls"].extend(second["choices"][0]["message"]["tool_calls"])
         return reply
     if request["model"] == "picked-mcp-fixture":
         names = [tool["function"]["name"] for tool in request["tools"]]
         visible = [name for name in names if name.startswith("mcp_")]
-        assert len(visible) == 1 and visible[0].endswith("_fixture_lookup")
-        assert visible[0] in request["messages"][0]["content"]
+        assert len(visible) == 2
+        selected = [next(name for name in visible if name.endswith(f"_{server}_lookup"))
+                    for server in ("fixture", "secondary")]
+        assert all(name in system_prompt for name in selected)
         results = [item["content"] for item in request["messages"] if item["role"] == "tool"]
-        if not results:
-            return tool_call(0, visible[0], {})
-        assert len(results) == 1 and "fixture lookup succeeded" in results[0]
+        assert all("fixture lookup succeeded" in result for result in results)
+        if len(results) < len(selected):
+            return tool_call(len(results), selected[len(results)], {})
+        assert len(results) == len(selected)
         return {"choices": [{"message": {"content": "Picked MCP fixture passed"}}]}
     if request["model"] == "picked-skill-fixture":
-        results = [item for item in request["messages"] if item["role"] == "tool"]
-        assert "test-notes" in results[0]["content"]
-        assert "tests/test-notes/notes.py" in results[0]["content"]
-        if len(results) == 1:
-            preload = request["messages"][-2]["tool_calls"][0]
-            assert preload["id"] == results[0]["tool_call_id"]
+        messages = request["messages"]
+        call_ids = set()
+        for index, (name, instructions) in enumerate([
+            ("test-notes", "tests/test-notes/notes.py"),
+            ("summary", "Use a bullet list."),
+        ]):
+            call, result = messages[2 + index * 2:4 + index * 2]
+            preload = call["tool_calls"][0]
+            assert result["role"] == "tool"
+            assert preload["id"] == result["tool_call_id"]
+            assert preload["id"] not in call_ids
+            call_ids.add(preload["id"])
             assert preload["function"]["name"] == "load_skill"
-            assert json.loads(preload["function"]["arguments"]) == {"name": "test-notes"}
+            assert json.loads(preload["function"]["arguments"]) == {"name": name}
+            assert instructions in result["content"]
+        if len(messages) == 6:
             return tool_call(0, "terminal", {"command": "python3", "args": ["tests/test-notes/notes.py", "list"]})
-        assert len(results) == 2
-        output = json.loads(results[-1]["content"])
+        assert len(messages) == 8
+        output = json.loads(messages[-1]["content"])
         assert output["exit_code"] == 0
         assert json.loads(output["stdout"]) == [{"id": 1, "title": "Shopping"}]
         return {"choices": [{"message": {"content": "Picked skill fixture passed"}}]}
@@ -181,6 +211,12 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/v1/models":
             body = {"data": [{"id": "llama fixture"}]}
+        elif parsed.path == "/compatible/v1/models":
+            body = {"data": [
+                {"id": "fixture/model", "context_length": 131072},
+                {"id": "fixture/zero", "context_length": 0},
+                {"id": "fixture/unknown"},
+            ]}
         elif parsed.path == "/props":
             selected = parse_qs(parsed.query)["model"]
             if selected in (["toggle fixture"], ["fixed fixture"]):

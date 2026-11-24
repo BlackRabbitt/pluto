@@ -15,7 +15,7 @@ Use [README.md](README.md) for setup and user-facing behavior. For dependency wo
 | --- | --- | --- |
 | Sidebar, message layout, Markdown, timestamps, or live tool status | [src/main.rs](src/main.rs) · `Desktop::show_ui`, `chat_message`, `tool_progress_ui` | `chat_layout_tests` |
 | Composer or `/` picker | [src/main.rs](src/main.rs) · `Desktop::composer_ui`, `Desktop::picker_ui` | `chat_layout_tests` |
-| Prompt, local clock, tool loop, or partial answer | [src/agent.rs](src/agent.rs) · `chat` | `chat_allows_52_tool_calls` |
+| Prompt, local clock, tool loop, or partial answer | [src/agent.rs](src/agent.rs) · `chat` | `chat_enforces_the_tool_call_limit` |
 | Provider URLs, model catalog, thinking, or context meter | [src/providers/mod.rs](src/providers/mod.rs) · `Connection`, then that provider’s file. For display, see `Desktop::chat_heading` and `Desktop::context_usage_ui`. | `provider_metadata_controls_chat_reasoning` or `llama_template_can_expose` |
 | Saved chats and archive | [src/history.rs](src/history.rs) · `ChatHistory`, `ChatStore`. For UI, see `Desktop::persist_chat`, `Desktop::open_chat`, `Desktop::move_active_chat`. | `saves_reopens_and_updates_separate_chats` |
 | Settings and manual saves | [src/main.rs](src/main.rs) · `Desktop::settings_ui`, `Desktop::save`. For TOML, see `Config` in [src/tools.rs](src/tools.rs). | `mcp_changes_require_an_explicit_save` |

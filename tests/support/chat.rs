@@ -1,6 +1,6 @@
 use crate::agent::{self, ApprovalDecision, Event, TokenUsage, ToolPhase, TurnSelection};
 use crate::diagnostics::Trace;
-use crate::providers::{Provider, ThinkingSetting};
+use crate::providers::{Connection, Provider, ThinkingSetting};
 use crate::tools::{ApprovalRule, Config, Mcp, McpToolId, ToolSet};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -14,7 +14,7 @@ async fn chat(
     config: Config,
     history: Vec<(String, String)>,
     thinking: Option<ThinkingSetting>,
-    selection: Option<TurnSelection>,
+    selection: TurnSelection,
     emit: impl Fn(Event),
 ) -> Result<String> {
     agent::chat(
@@ -74,7 +74,7 @@ async fn global_auto_approval_runs_and_tracks_terminal_and_mcp_calls() -> Result
         config,
         vec![("user".into(), "Run the fixture".into())],
         None,
-        None,
+        TurnSelection::default(),
         &trace,
         |event| match event {
             Event::Approve(..) => panic!("Global auto-approval must not open a confirmation"),
@@ -124,7 +124,7 @@ async fn retry_model_call_after_503_reuses_tool_result() -> Result<()> {
         config,
         vec![("user".into(), "Run the fixture".into())],
         None,
-        None,
+        TurnSelection::default(),
         &trace,
         |event| match event {
             Event::Approve(_, decision) => {
@@ -156,14 +156,14 @@ async fn retry_model_call_after_503_reuses_tool_result() -> Result<()> {
 }
 
 #[tokio::test]
-async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
+async fn chat_enforces_the_tool_call_limit() -> Result<()> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
     let (_http, port) = http_fixture(&script).await?;
     for (model, expected_answer) in [
-        ("tool-limit-fixture", "52 tool calls completed"),
+        ("tool-limit-fixture", "128 tool calls completed"),
         (
             "tool-limit-overflow-fixture",
-            "Summary of the 52 completed requests",
+            "Summary of the 128 completed requests",
         ),
         (
             "tool-limit-no-summary-fixture",
@@ -177,22 +177,27 @@ async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
             ..Config::default()
         };
         let calls = std::cell::Cell::new(0);
-        let (log, entries) = std::sync::mpsc::sync_channel(512);
+        let (log, entries) = std::sync::mpsc::sync_channel(1024);
         let trace = Trace::new(Some(log));
         let result = agent::chat(
-            config,
+            config.clone(),
             vec![("user".into(), "Run the fixture".into())],
             None,
-            None,
+            TurnSelection::default(),
             &trace,
-            |event| {
-                if matches!(event, Event::Tool(tool) if tool.activity.name == "MCP tool discovery" && tool.phase == ToolPhase::Running) {
+            |event| match event {
+                Event::Tool(tool)
+                    if tool.activity.name == "MCP tool discovery"
+                        && tool.phase == ToolPhase::Running =>
+                {
                     calls.set(calls.get() + 1);
                 }
+                Event::Approve(..) => panic!("The skipped batch must not request approval"),
+                _ => {}
             },
         )
         .await;
-        assert_eq!(calls.get(), 52);
+        assert_eq!(calls.get(), 128);
         let entries: Vec<Value> = entries
             .try_iter()
             .map(serde_json::to_value)
@@ -202,14 +207,43 @@ async fn chat_allows_52_tool_calls_and_caps_additional_calls() -> Result<()> {
                 .iter()
                 .filter(|entry| entry["event"] == "tool_finished")
                 .count(),
-            52
+            128
         );
         assert!(
             entries
                 .iter()
                 .all(|entry| !entry.to_string().contains("Run the fixture"))
         );
-        assert!(result?.contains(expected_answer));
+        let answer = result?;
+        assert!(answer.contains(expected_answer));
+        if model != "tool-limit-fixture" {
+            assert!(answer.contains("skipped the entire pending batch of 2 calls"));
+            assert!(answer.contains("`find_tools`, `terminal`"));
+            assert!(answer.contains("**Next step**"));
+        }
+        if model == "tool-limit-no-summary-fixture" {
+            assert!(!answer.contains("pending-marker"));
+        }
+        if model == "tool-limit-overflow-fixture" {
+            let follow_up = chat(
+                config,
+                vec![
+                    ("user".into(), "Run the fixture".into()),
+                    ("assistant".into(), answer),
+                    ("user".into(), "Continue".into()),
+                ],
+                None,
+                TurnSelection::default(),
+                |event| {
+                    if let Event::Approve(request, reply) = event {
+                        assert!(request.description.contains("pending-marker"));
+                        let _ = reply.send(ApprovalDecision::RunOnce);
+                    }
+                },
+            )
+            .await?;
+            assert_eq!(follow_up, "Resumed from the handoff");
+        }
         let final_requests: Vec<_> = entries
             .iter()
             .filter(|entry| {
@@ -279,7 +313,7 @@ async fn provider_metadata_controls_chat_reasoning() -> Result<()> {
             config,
             Vec::new(),
             Some(ThinkingSetting::Effort(selected.into())),
-            None,
+            TurnSelection::default(),
             |event| {
                 if let Event::Usage {
                     model: reported_model,
@@ -331,7 +365,7 @@ async fn llama_template_can_expose_a_thinking_switch_without_named_levels() -> R
             config.clone(),
             Vec::new(),
             Some(level.setting),
-            None,
+            TurnSelection::default(),
             |_| {},
         )
         .await?;
@@ -351,6 +385,31 @@ async fn llama_template_can_expose_a_thinking_switch_without_named_levels() -> R
             .thinking?
             .is_empty()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn compatible_context_limits_come_from_the_selected_model() -> Result<()> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.py");
+    let (_http, port) = http_fixture(&script).await?;
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let openai = Connection::new(
+        Provider::OpenAiCompatible,
+        &format!("{base_url}/compatible/v1"),
+        "",
+    )?;
+    for (model, limit) in [
+        ("fixture/model", Some(131_072)),
+        ("fixture/zero", None),
+        ("fixture/unknown", None),
+        ("absent", None),
+    ] {
+        assert_eq!(
+            openai.capabilities(&client, model).await?.context_window,
+            limit
+        );
+    }
     Ok(())
 }
 
@@ -375,6 +434,13 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
         config.model_url = format!("http://127.0.0.1:{port}/v1");
         let name = config.add_skill(&example)?;
         assert_eq!(name, "test-notes");
+        let summary_skill = workspace.join("summary");
+        fs::create_dir(&summary_skill)?;
+        fs::write(
+            summary_skill.join("SKILL.md"),
+            "---\nname: summary\ndescription: Summarize notes\n---\nUse a bullet list.",
+        )?;
+        let summary = config.add_skill(&summary_skill)?;
         let tools = ToolSet::connect(&config, |_| {}).await;
         let skill = tools.call("load_skill", json!({ "name": name })).await?;
         assert!(skill.contains("tests/test-notes/notes.py"));
@@ -394,19 +460,19 @@ async fn pluto_loads_and_runs_the_test_notes_skill() -> Result<()> {
         assert_eq!(note, json!({"id": 1, "title": "Shopping"}));
         drop(tools);
         let approved = std::cell::Cell::new(false);
-        let skill_loaded = std::cell::Cell::new(false);
+        let loaded_skills = std::cell::RefCell::new(Vec::new());
         let answer = chat(
             config,
             vec![("user".into(), "List my notes".into())],
             None,
-            Some(TurnSelection::Skill(name)),
+            TurnSelection {
+                skills: vec![name, summary],
+                ..Default::default()
+            },
             |event| match event {
-                Event::SkillLoaded(name) => {
-                    assert_eq!(name, "test-notes");
-                    skill_loaded.set(true);
-                }
+                Event::SkillLoaded(name) => loaded_skills.borrow_mut().push(name),
                 Event::Approve(request, reply) => {
-                    assert!(skill_loaded.get());
+                    assert_eq!(*loaded_skills.borrow(), ["test-notes", "summary"]);
                     assert!(request.description.contains("notes.py"));
                     approved.set(true);
                     let _ = reply.send(ApprovalDecision::RunOnce);
@@ -454,7 +520,7 @@ async fn find_tools_exposes_fixture_schemas_on_demand() -> Result<()> {
         config.clone(),
         vec![("user".into(), "Find and use the fixture lookup tool".into())],
         None,
-        None,
+        TurnSelection::default(),
         |event| match event {
             Event::Approve(request, reply) => {
                 assert!(request.description.starts_with("Call fixture / lookup"));
@@ -469,37 +535,47 @@ async fn find_tools_exposes_fixture_schemas_on_demand() -> Result<()> {
     assert_eq!(result, "MCP discovery fixture passed");
     assert_eq!(approvals.get(), 1);
 
-    let expected = McpToolId {
-        server: "fixture".into(),
-        name: "lookup".into(),
-    };
     let tools = ToolSet::connect(&config, |warning| {
         panic!("Unexpected discovery warning: {warning}")
     })
     .await;
-    let selected = tools
-        .mcp_tool_choices()
-        .into_iter()
-        .find(|item| *item == expected)
-        .context("Fixture lookup missing in picker catalog")?;
+    let choices = tools.mcp_tool_choices();
+    let selected = ["fixture", "secondary"].map(|server| McpToolId {
+        server: server.into(),
+        name: "lookup".into(),
+    });
+    assert!(selected.iter().all(|tool| choices.contains(tool)));
     drop(tools);
     config.model_name = "picked-mcp-fixture".into();
+    let selected_approvals = std::cell::RefCell::new(Vec::new());
     let result = chat(
         config,
-        vec![("user".into(), "Run the selected lookup".into())],
+        vec![("user".into(), "Run the selected lookups".into())],
         None,
-        Some(TurnSelection::Mcp(selected)),
+        TurnSelection {
+            mcp: selected.into(),
+            ..Default::default()
+        },
         |event| {
             if let Event::Approve(request, reply) = event {
-                assert!(request.description.starts_with("Call fixture / lookup"));
-                approvals.set(approvals.get() + 1);
+                selected_approvals.borrow_mut().push(
+                    request
+                        .description
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 let _ = reply.send(ApprovalDecision::RunOnce);
             }
         },
     )
     .await?;
     assert_eq!(result, "Picked MCP fixture passed");
-    assert_eq!(approvals.get(), 2);
+    assert_eq!(
+        selected_approvals.into_inner(),
+        ["Call fixture / lookup", "Call secondary / lookup"]
+    );
     Ok(())
 }
 
@@ -548,7 +624,7 @@ async fn chat_loads_skill_runs_cli_and_calls_both_mcp_transports() -> Result<()>
         config,
         vec![("user".into(), "Run the fixture".into())],
         None,
-        None,
+        TurnSelection::default(),
         |event| match event {
             Event::Tool(tool) => activity.borrow_mut().push(tool),
             Event::SkillLoaded(name) => loaded_skills.borrow_mut().push(name),

@@ -128,7 +128,7 @@ impl Connection {
             }),
             Provider::OpenAiCompatible => Ok(ModelCapabilities {
                 thinking: Ok(Vec::new()),
-                context_window: None,
+                context_window: openai_compatible::context_window(self, client, model).await,
             }),
         }
     }

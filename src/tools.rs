@@ -32,6 +32,7 @@ pub struct Config {
     pub model_url: String,
     pub model_name: String,
     pub model_token_env: String,
+    pub model_context_limit: u32,
     pub workspace: PathBuf,
     pub auto_approve_tools: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -162,6 +163,7 @@ impl Default for Config {
             model_url: String::new(),
             model_name: String::new(),
             model_token_env: String::new(),
+            model_context_limit: 0,
             workspace: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             auto_approve_tools: false,
             terminal_approvals: Vec::new(),

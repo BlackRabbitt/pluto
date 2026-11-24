@@ -2,7 +2,7 @@
 
 <img src="assets/pluto-icon.png" alt="Pluto Evergreen icon" width="112" height="112">
 
-Pluto is a lightweight Rust desktop chatbot for local and remote models. It can load skills, run terminal commands, and call MCP tools. Chats are saved as local JSON files.
+Pluto is a free, local-first Rust desktop chatbot for free and open models. Run a model with llama.cpp or Ollama, or connect to an OpenAI-compatible server hosting an open model. Pluto can load skills, run terminal commands, and call MCP tools. Chats are saved as local JSON files.
 
 ## Run Pluto
 
@@ -38,7 +38,7 @@ The installer updates the app in your Applications folder and the Terminal execu
 
 ### Connect a model
 
-1. Open **Settings** and pick a provider.
+1. Open **Settings** and choose **llama.cpp** or **Ollama** for a local model. Choose **OpenAI-compatible** to connect to a server that exposes that API.
 2. Enter the server URL and any required token environment variable. Then click **Load models** and pick a model, or enter its model ID directly.
 3. Set **Terminal working directory** if you plan to run commands. Click **Save settings** and open **Chat**.
 
@@ -46,10 +46,9 @@ The installer updates the app in your Applications folder and the Terminal execu
 | --- | --- |
 | **llama.cpp** | The server base URL, for example `http://localhost:8080` |
 | **Ollama** | The server base URL, for example `http://localhost:11434` |
-| **OpenAI-compatible** | The provider’s API base URL, including its required path such as `/v1` |
-| **Google AI Studio** | Pick **OpenAI-compatible** and use `https://generativelanguage.googleapis.com/v1beta/openai/`. [Google’s setup guide](https://ai.google.dev/gemini-api/docs/openai) |
+| **OpenAI-compatible** | The API base URL for a server offering a free, open model, including its required path such as `/v1` |
 
-For an authenticated model or MCP server, export the key before launching Pluto. In Settings, enter the **variable name**, such as `GEMINI_API_KEY`. If Pluto can load the model list but chat returns a 404, check that your model ID supports text chat on that endpoint.
+For an authenticated model or MCP server, export the key before launching Pluto. In Settings, enter the **variable name**, such as `MODEL_API_KEY`. If Pluto can load the model list but chat returns a 404, check that your model ID supports text chat on that endpoint.
 
 #### Connect to a model on your local network from macOS
 
@@ -82,13 +81,13 @@ channel = "1.100.0"
 
 - Use the **Thinking** menu to select a level or toggle when llama.cpp or Ollama reports support. **Server default** uses the server’s own behavior. The choice applies to subsequent messages with that model.
 - While waiting for a model response, Chat shows a spinner and the current phase: **Thinking…**, **Reviewing tool results…**, or **Writing a partial answer…**. When a model includes a leading `<think>` block in its reply, expand **Model thinking** to see it.
-- Chat shows token usage when the model reports it. For llama.cpp, it also shows the context window reported by the server. Change the llama.cpp context size when launching the server.
+- Chat shows token usage for the last model request. With llama.cpp, the bar shows input and output tokens against the server's configured context size. With an OpenAI-compatible server that reports a context limit, the bar shows input tokens against that limit. You can also set **Context limit (input tokens)** in Settings for Ollama or OpenAI-compatible servers.
 - Pluto sends the full transcript of the open chat and the computer’s local date, time, and time zone to the configured model. New messages show a timestamp below the sender name.
 - Reopen conversations under **Recent chats**. Pluto opens the most recently updated chat on launch. Use **Archive chat** to move a conversation out of the recent list, and **Restore chat** to continue it.
 
 ## Use skills and tools
 
-Type `/` at the start of the message box to pick a skill or MCP tool. Filter by typing, then click a result or use **↑**, **↓**, and **Enter**. Type your request and send it. The selection applies to that message.
+Type `/` at the start of the message box to pick a skill or MCP tool. Filter by typing, then click a result or use **↑**, **↓**, and **Enter**. Type `/` again to add more skills or MCP tools before writing your request. Use **×** to remove a selection. Selections apply to the next message you send.
 
 ### Add or update a skill
 
@@ -162,7 +161,7 @@ Manage these options under **Settings → Tool approvals**. Use **Saved approval
 
 These live together under `~/Library/Application Support/pluto/` on macOS, or under `pluto/` in the OS user config directory. Set `PLUTO_CONFIG` to choose a different settings file. Chats and logs sit beside it. On first launch, Pluto moves the previous default data folder if the new one does not yet exist.
 
-If a batch would exceed **52 tool calls** in a message, Pluto skips that batch and asks for a partial answer using the results already gathered.
+If a batch would exceed **128 tool calls** in a message, Pluto skips that batch and asks the model to summarize what it completed, where it stopped, and what to do next. The reply stays in the chat so you can ask Pluto to continue.
 
 ### Check diagnostics
 

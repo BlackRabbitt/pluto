@@ -29,6 +29,7 @@ use tools::{ApprovalRequest, ApprovalRule, Config, Mcp, McpToolId, ToolSet};
 const APP_NAME: &str = "Pluto";
 const CHAT_DRAFT_HEIGHT: f32 = 80.0;
 const CHAT_PICKER_HEIGHT: f32 = 155.0;
+const CHAT_SELECTION_ROWS: usize = 3;
 
 fn configure_fonts(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -272,6 +273,37 @@ mod chat_layout_tests {
     use super::*;
 
     #[test]
+    fn compatible_context_meter_uses_input_tokens_and_the_selected_limit() -> Result<()> {
+        let config = Config {
+            model_provider: Some(Provider::OpenAiCompatible),
+            ..Config::default()
+        };
+        let context = egui::Context::default();
+        let mut desktop = Desktop::with_config(config, String::new(), None, None)?;
+        desktop.context_usage = Some(TokenUsage {
+            input: 100,
+            output: 20,
+        });
+        let shows = |desktop: &Desktop, label| {
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| desktop.context_usage_ui(ui));
+            });
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+            })
+        };
+        assert!(shows(&desktop, "120 tokens · last request"));
+        desktop.capabilities = Lookup::Complete(Ok(ModelCapabilities {
+            thinking: Ok(Vec::new()),
+            context_window: Some(1_000),
+        }));
+        assert!(shows(&desktop, "100 / 1000 input tokens"));
+        desktop.config.model_context_limit = 2_000;
+        assert!(shows(&desktop, "100 / 2000 input tokens"));
+        Ok(())
+    }
+
+    #[test]
     fn long_chat_and_draft_leave_composer_visible() -> Result<()> {
         let context = egui::Context::default();
         configure_fonts(&context);
@@ -357,6 +389,9 @@ mod chat_layout_tests {
             ..Config::default()
         };
         config.add_skill(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-notes"))?;
+        config
+            .skills
+            .insert("summary".into(), config.skills["test-notes"].clone());
         let mut desktop = Desktop::with_config(config, String::new(), None, None)?;
         desktop.sync_discovery();
         desktop.capabilities = Lookup::Complete(Ok(ModelCapabilities {
@@ -387,10 +422,12 @@ mod chat_layout_tests {
         desktop.history.push("assistant", markdown.into());
         desktop.prompt = "/".into();
         desktop.picker_catalog = Lookup::Complete(Ok(PickerCatalog {
-            tools: vec![McpToolId {
-                server: "fixture".into(),
-                name: "lookup".into(),
-            }],
+            tools: ["fixture", "secondary"]
+                .map(|server| McpToolId {
+                    server: server.into(),
+                    name: "lookup".into(),
+                })
+                .into(),
             warnings: Vec::new(),
         }));
 
@@ -475,6 +512,48 @@ mod chat_layout_tests {
             desktop.thinking_setting,
             Some(ThinkingSetting::Toggle(true))
         );
+
+        let labels = render(&mut desktop, Vec::new());
+        render(&mut desktop, click(find_label(&labels, "test-notes")));
+        assert_eq!(desktop.selection.skills, ["test-notes"]);
+        render(&mut desktop, vec![egui::Event::Text("/".into())]);
+        assert_eq!(desktop.picker_query(), Some(""));
+        let labels = render(&mut desktop, Vec::new());
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|(label, _)| label == "test-notes")
+                .count(),
+            1
+        );
+        render(&mut desktop, click(find_label(&labels, "summary")));
+        assert_eq!(desktop.selection.skills, ["test-notes", "summary"]);
+        let labels = render(&mut desktop, Vec::new());
+        for expected in ["test-notes", "summary", "Send"] {
+            find_label(&labels, expected);
+        }
+        render(&mut desktop, click(find_label(&labels, "×")));
+        assert_eq!(desktop.selection.skills, ["summary"]);
+        desktop.prompt = "/".into();
+        let labels = render(&mut desktop, Vec::new());
+        render(&mut desktop, click(find_label(&labels, "fixture / lookup")));
+        assert_eq!(desktop.selection.mcp.len(), 1);
+        render(&mut desktop, vec![egui::Event::Text("/".into())]);
+        assert_eq!(desktop.picker_query(), Some(""));
+        let labels = render(&mut desktop, Vec::new());
+        render(
+            &mut desktop,
+            click(find_label(&labels, "secondary / lookup")),
+        );
+        assert_eq!(desktop.selection.mcp.len(), 2);
+        assert!(desktop.picker_choices("lookup").is_empty());
+        assert_eq!(desktop.selection.skills, ["summary"]);
+        for _ in 0..3 {
+            let labels = render(&mut desktop, Vec::new());
+            render(&mut desktop, click(find_label(&labels, "×")));
+        }
+        assert!(desktop.selection.skills.is_empty());
+        assert!(desktop.selection.mcp.is_empty());
 
         desktop.prompt.clear();
         desktop.busy = true;
@@ -763,6 +842,21 @@ struct PickerCatalog {
     warnings: Vec<String>,
 }
 
+#[derive(Clone)]
+enum PickerChoice {
+    Skill(String),
+    Mcp(McpToolId),
+}
+
+impl PickerChoice {
+    fn label(&self) -> String {
+        match self {
+            Self::Skill(name) => name.clone(),
+            Self::Mcp(tool) => format!("{} / {}", tool.server, tool.name),
+        }
+    }
+}
+
 enum ChatStatus {
     Idle,
     Preparing(String),
@@ -794,7 +888,7 @@ struct Desktop {
     chat_dirty: bool,
     history_notice: Option<String>,
     prompt: String,
-    selection: Option<TurnSelection>,
+    selection: TurnSelection,
     picker_catalog: Lookup<PickerCatalog>,
     picker_index: usize,
     settings: bool,
@@ -920,7 +1014,7 @@ impl Desktop {
             chat_dirty: false,
             history_notice,
             prompt: String::new(),
-            selection: None,
+            selection: TurnSelection::default(),
             picker_catalog: Lookup::Idle,
             picker_index: 0,
             busy: false,
@@ -948,10 +1042,12 @@ impl Desktop {
             self.notice = "Choose a provider, enter its server URL, and select a model.".into();
             return;
         }
-        let selection = self.selection.take();
-        self.status = ChatStatus::Preparing(match &selection {
-            Some(TurnSelection::Skill(name)) => format!("Preparing to load skill · {name}…"),
-            _ => "Discovering tools…".into(),
+        let selection = std::mem::take(&mut self.selection);
+        self.picker_catalog = Lookup::Idle;
+        self.status = ChatStatus::Preparing(match selection.skills.as_slice() {
+            [] => "Discovering tools…".into(),
+            [name] => format!("Preparing to load skill · {name}…"),
+            skills => format!("Preparing to load {} skills…", skills.len()),
         });
         self.tool_progress = None;
         self.connection_errors.clear();
@@ -980,7 +1076,7 @@ impl Desktop {
     }
 
     fn picker_query(&self) -> Option<&str> {
-        if self.busy || self.selection.is_some() {
+        if self.busy {
             return None;
         }
         self.prompt
@@ -988,7 +1084,7 @@ impl Desktop {
             .filter(|query| !query.contains(['/', '\n', '\r']))
     }
 
-    fn picker_choices(&self, query: &str) -> Vec<TurnSelection> {
+    fn picker_choices(&self, query: &str) -> Vec<PickerChoice> {
         let query = query.to_lowercase();
         let matches = |label: &str| {
             let label = label.to_lowercase();
@@ -998,17 +1094,18 @@ impl Desktop {
             .config
             .skills
             .keys()
-            .filter(|name| matches(name))
+            .filter(|name| matches(name) && !self.selection.skills.contains(name))
             .cloned()
-            .map(TurnSelection::Skill)
+            .map(PickerChoice::Skill)
             .collect();
         if let Lookup::Complete(Ok(catalog)) = &self.picker_catalog {
             choices.extend(
                 catalog
                     .tools
                     .iter()
+                    .filter(|tool| !self.selection.mcp.contains(tool))
                     .cloned()
-                    .map(TurnSelection::Mcp)
+                    .map(PickerChoice::Mcp)
                     .filter(|selection| matches(&selection.label())),
             );
         }
@@ -1053,8 +1150,8 @@ impl Desktop {
                 let mut current_group = "";
                 for (index, choice) in choices.iter().enumerate() {
                     let group = match choice {
-                        TurnSelection::Skill(_) => "Skills",
-                        TurnSelection::Mcp(_) => "MCP tools",
+                        PickerChoice::Skill(_) => "Skills",
+                        PickerChoice::Mcp(_) => "MCP tools",
                     };
                     if group != current_group {
                         ui.label(RichText::new(group).small().strong());
@@ -1095,12 +1192,21 @@ impl Desktop {
                     ui.label("No matching skills or MCP tools");
                 }
             });
-        if let Some(selection) = picked {
-            self.selection = Some(selection);
+        if let Some(choice) = picked {
+            match choice {
+                PickerChoice::Skill(name) => self.selection.skills.push(name),
+                PickerChoice::Mcp(tool) => self.selection.mcp.push(tool),
+            }
             self.prompt.clear();
-            self.picker_catalog = Lookup::Idle;
+            self.picker_index = 0;
             ui.memory_mut(|memory| memory.request_focus(input));
         }
+    }
+
+    fn selection_height(&self, ui: &egui::Ui) -> f32 {
+        let count = self.selection.skills.len() + self.selection.mcp.len();
+        let rows = count.min(CHAT_SELECTION_ROWS);
+        rows as f32 * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y)
     }
 
     fn composer_ui(&mut self, ui: &mut egui::Ui) {
@@ -1109,15 +1215,36 @@ impl Desktop {
             return;
         }
         let input_id = ui.make_persistent_id("chat_composer");
-        if let Some(selection) = &self.selection {
-            let clear = ui
-                .horizontal(|ui| {
-                    ui.label(format!("For this message · {}", selection.label()));
-                    ui.small_button("Clear selection").clicked()
+        let selection_height = self.selection_height(ui);
+        if selection_height > 0.0 {
+            let removed = egui::ScrollArea::vertical()
+                .id_salt("composer_selection")
+                .max_height(selection_height - ui.spacing().item_spacing.y)
+                .min_scrolled_height(0.0)
+                .show(ui, |ui| {
+                    let mut removed = false;
+                    let mut keep_row = |label: &str| {
+                        let remove = ui
+                            .horizontal(|ui| {
+                                let remove = ui
+                                    .small_button("×")
+                                    .on_hover_text(format!("Remove {label}"))
+                                    .clicked();
+                                ui.add(egui::Label::new(label).truncate());
+                                remove
+                            })
+                            .inner;
+                        removed |= remove;
+                        !remove
+                    };
+                    self.selection.skills.retain(|name| keep_row(name));
+                    self.selection
+                        .mcp
+                        .retain(|tool| keep_row(&format!("{} / {}", tool.server, tool.name)));
+                    removed
                 })
                 .inner;
-            if clear {
-                self.selection = None;
+            if removed {
                 ui.memory_mut(|memory| memory.request_focus(input_id));
             }
         }
@@ -1145,7 +1272,7 @@ impl Desktop {
                     !self.busy,
                     TextEdit::multiline(&mut self.prompt)
                         .id(input_id)
-                        .hint_text("Message Pluto or type / to pick a tool")
+                        .hint_text("Message Pluto or type / to pick a skill or tool")
                         .desired_rows(2)
                         .desired_width(f32::INFINITY),
                 )
@@ -1158,7 +1285,9 @@ impl Desktop {
             self.picker_ui(ui, input_id, previous, next, select);
             return;
         }
-        self.picker_catalog = Lookup::Idle;
+        if self.selection.skills.is_empty() && self.selection.mcp.is_empty() {
+            self.picker_catalog = Lookup::Idle;
+        }
         let keyboard = input.has_focus()
             && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
         if ui
@@ -1210,7 +1339,8 @@ impl Desktop {
             ChatHistory::default()
         };
         self.active_chat = path;
-        self.selection = None;
+        self.selection = TurnSelection::default();
+        self.picker_catalog = Lookup::Idle;
         self.history = history;
         self.loaded_skills.clear();
         self.context_usage = None;
@@ -1474,6 +1604,8 @@ impl Desktop {
     fn model_settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("Provider");
         let previous_provider = self.config.model_provider;
+        let previous_url = self.config.model_url.clone();
+        let previous_model = self.config.model_name.clone();
         let provider_label = previous_provider.map_or("Choose a provider", Provider::label);
         egui::ComboBox::from_id_salt("model_provider")
             .selected_text(provider_label)
@@ -1553,6 +1685,21 @@ impl Desktop {
             &mut self.config.model_name,
             "Select from the list or enter a model name",
         );
+        if self.config.model_provider != previous_provider
+            || self.config.model_url.trim() != previous_url.trim()
+            || self.config.model_name.trim() != previous_model.trim()
+        {
+            self.config.model_context_limit = 0;
+        }
+        if provider != Provider::LlamaCpp {
+            ui.horizontal(|ui| {
+                ui.label("Context limit (input tokens)");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.model_context_limit).range(0..=u32::MAX),
+                )
+                .on_hover_text("Set to 0 to use the model's reported limit.");
+            });
+        }
     }
 
     fn chat_heading(&mut self, ui: &mut egui::Ui) {
@@ -1561,8 +1708,14 @@ impl Desktop {
             let Some(connection) = self.discovery_connection.clone() else {
                 return;
             };
-            if connection.provider == Provider::OpenAiCompatible || self.discovery_model.is_empty()
-            {
+            if self.discovery_model.is_empty() {
+                return;
+            }
+            if connection.provider == Provider::OpenAiCompatible {
+                if self.config.model_context_limit == 0 && matches!(self.capabilities, Lookup::Idle)
+                {
+                    self.start_capabilities_lookup(ui, connection);
+                }
                 return;
             }
             let thinking = match &self.capabilities {
@@ -1613,29 +1766,40 @@ impl Desktop {
                 }
             };
             if refresh {
-                let client = self.discovery_client.clone();
-                let model = self.discovery_model.clone();
-                self.capabilities
-                    .start(&self.runtime, ui.ctx(), async move {
-                        connection.capabilities(&client, &model).await
-                    });
+                self.start_capabilities_lookup(ui, connection);
             }
         });
         self.context_usage_ui(ui);
     }
 
+    fn start_capabilities_lookup(&mut self, ui: &egui::Ui, connection: Connection) {
+        let client = self.discovery_client.clone();
+        let model = self.discovery_model.clone();
+        self.capabilities
+            .start(&self.runtime, ui.ctx(), async move {
+                connection.capabilities(&client, &model).await
+            });
+    }
+
     fn context_usage_ui(&self, ui: &mut egui::Ui) {
-        let window = match &self.capabilities {
+        let reported_window = match &self.capabilities {
             Lookup::Complete(Ok(capabilities)) => capabilities.context_window,
             _ => None,
         };
+        let input_only = self.config.model_provider != Some(Provider::LlamaCpp);
+        let override_limit = self.config.model_context_limit;
+        let window = if input_only && override_limit > 0 {
+            Some(u64::from(override_limit))
+        } else {
+            reported_window
+        };
+        let units = if input_only { "input tokens" } else { "tokens" };
         let Some(usage) = self.context_usage else {
             if let Some(window) = window {
-                ui.label(RichText::new(format!("Context window · {window} tokens")).small());
+                ui.label(RichText::new(format!("Context window · {window} {units}")).small());
             }
             return;
         };
-        let used = usage.total();
         let details = format!(
             "Last model request\nInput: {} tokens\nOutput: {} tokens",
             usage.input, usage.output
@@ -1643,6 +1807,11 @@ impl Desktop {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Context").small().strong());
             if let Some(window) = window {
+                let used = if input_only {
+                    usage.input
+                } else {
+                    usage.total()
+                };
                 let fraction = used as f64 / window as f64;
                 let fill = if fraction >= 0.9 {
                     ui.visuals().warn_fg_color
@@ -1655,11 +1824,11 @@ impl Desktop {
                         .fill(fill),
                 )
                 .on_hover_text(&details);
-                ui.label(RichText::new(format!("{used} / {window} tokens")).small())
+                ui.label(RichText::new(format!("{used} / {window} {units}")).small())
                     .on_hover_text(&details);
             } else {
-                ui.label(RichText::new(format!("{used} tokens · last request")).small())
-                    .on_hover_text(&details);
+                ui.label(RichText::new(format!("{} tokens · last request", usage.total())).small())
+                    .on_hover_text(format!("{details}\nContext limit unavailable"));
             }
         });
     }
@@ -2067,12 +2236,7 @@ impl Desktop {
                     } else {
                         row
                     };
-                    let selection = if self.selection.is_some() {
-                        row + spacing
-                    } else {
-                        0.0
-                    };
-                    selection + CHAT_DRAFT_HEIGHT + actions + 2.0 * spacing
+                    self.selection_height(ui) + CHAT_DRAFT_HEIGHT + actions + 2.0 * spacing
                 };
                 egui::TopBottomPanel::bottom("chat_composer_panel")
                     .exact_height(composer_height)
