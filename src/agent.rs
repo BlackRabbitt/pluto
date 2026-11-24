@@ -334,6 +334,16 @@ pub async fn chat(
                 Err(error) => error,
             };
             let find_fallback = can_route && (cooling || cloud_model_unavailable(&error));
+            let http_status = error
+                .downcast_ref::<reqwest::Error>()
+                .and_then(reqwest::Error::status);
+            let fallback_reason = if cooling {
+                "cooldown"
+            } else if http_status.is_some() {
+                "http_status"
+            } else {
+                "request_error"
+            };
             if find_fallback {
                 let failed_model = if cooling || retry_delay.is_some() {
                     None
@@ -376,13 +386,22 @@ pub async fn chat(
                 }
             });
             if let Some((next_connection, next_model, context_window)) = fallback {
+                trace.record("model_fallback", || {
+                    json!({
+                        "request": request_number,
+                        "from_provider": connection.provider.label(),
+                        "from_model": model,
+                        "reason": fallback_reason,
+                        "http_status": http_status.map(|status| status.as_u16()),
+                        "retry_after_seconds": retry_delay.map(|delay| delay.as_secs()),
+                        "model": next_model,
+                        "provider": next_connection.provider.label(),
+                        "context_window": context_window,
+                    })
+                });
                 connection = next_connection;
                 model = next_model;
                 thinking = None;
-                trace.record(
-                    "model_fallback",
-                    || json!({"model": model, "provider": connection.provider.label(), "context_window": context_window}),
-                );
                 emit(Event::ModelSwitched {
                     model: model.into(),
                     origin: connection.origin(),
@@ -390,6 +409,18 @@ pub async fn chat(
                     context_window,
                 });
                 continue;
+            }
+            if find_fallback {
+                trace.record("model_fallback_unavailable", || {
+                    json!({
+                        "request": request_number,
+                        "model": model,
+                        "provider": connection.provider.label(),
+                        "reason": fallback_reason,
+                        "http_status": http_status.map(|status| status.as_u16()),
+                        "retry_after_seconds": retry_delay.map(|delay| delay.as_secs()),
+                    })
+                });
             }
             if cooling || retryable_model_error(&error) {
                 let (retry, decision) = oneshot::channel();

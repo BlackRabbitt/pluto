@@ -56,6 +56,15 @@ struct ChatTitle {
 }
 
 impl ChatStore {
+    pub fn chat_id(path: &Path) -> Option<&str> {
+        let id = path.file_stem()?.to_str()?;
+        let mut parts = id.splitn(3, '-');
+        parts.next()?.parse::<u128>().ok()?;
+        parts.next()?.parse::<u32>().ok()?;
+        parts.next()?.parse::<u64>().ok()?;
+        Some(id)
+    }
+
     pub fn beside(config_path: &Path) -> Self {
         Self {
             directory: config_path
@@ -248,6 +257,7 @@ mod tests {
             r#"{"title":"First chat","messages":[["user","First chat\nwith two lines"]]}"#,
         )?;
         let first_entry = store.save(None, &first)?;
+        let chat_id = ChatStore::chat_id(&first_entry.path).context("Missing saved chat ID")?;
         assert_eq!(first_entry.title, "First chat with two lines");
         let mut second = ChatHistory::default();
         second.push("user", "Second chat".into());
@@ -271,6 +281,7 @@ mod tests {
 
         let original = fs::read(&first_entry.path)?;
         let archive = reopened.archive(&first_entry.path)?;
+        assert_eq!(ChatStore::chat_id(&archive), Some(chat_id));
         let reopened = ChatStore::beside(&config);
         assert!(reopened.is_archived(&archive));
         assert_eq!(reopened.entries()?.0.len(), 1);
@@ -285,6 +296,7 @@ mod tests {
         fs::remove_file(&first_entry.path)?;
 
         let restored = reopened.restore(&archive)?;
+        assert_eq!(ChatStore::chat_id(&restored), Some(chat_id));
         assert_eq!(restored, first_entry.path);
         assert_eq!(fs::read(&restored)?, original);
         assert!(reopened.archived_entries()?.0.is_empty());

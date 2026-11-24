@@ -211,6 +211,14 @@ jq -rs '
 
 If you set `PLUTO_CONFIG`, use the `agent-debug.jsonl` beside that settings file. The log records metadata and names and omits prompts, raw arguments, credentials, and tool output. Identical argument text shares an `arguments_id` within a turn. Pluto keeps the current log and `agent-debug.previous.jsonl`, up to 2 MiB each.
 
+For a saved chat, click **Copy chat ID** beside the Chat heading. The ID matches the filename stem in `chats/` or `chats/archive/` and appears as `chat_id` on each new event. Filter by that ID to see all turns still in the logs.
+
+```sh
+jq --arg chat_id 'PASTE_CHAT_ID_HERE' 'select(.chat_id == $chat_id)' \
+  "$HOME/Library/Application Support/pluto/agent-debug.jsonl"
+```
+
+- For model switching, `model_fallback` records the source, destination, and trigger, and `model_fallback_unavailable` records when no eligible backup was found. Later model request events show whether the selected model responded.
 - To follow tool discovery, look for `tool_requested` with `"tool":"find_tools"`. The `mcp_tools_matched` event lists matched aliases for that batch when there are any. The next `model_request` reports `tools_offered`.
 - For a background job, `tool_finished` with `"outcome":"returned"` marks when the tool returned its response. A status check, if the model requests one, appears as a separate tool call.
 

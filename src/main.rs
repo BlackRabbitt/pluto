@@ -1094,7 +1094,8 @@ impl Desktop {
         let thinking = self.thinking_setting.clone();
         let cooldowns = self.model_cooldowns.clone();
         let sender = self.sender.clone();
-        let trace = diagnostics::Trace::new(self.diagnostics.clone());
+        let chat_id = self.active_chat.as_deref().and_then(ChatStore::chat_id);
+        let trace = diagnostics::Trace::new(self.diagnostics.clone(), chat_id);
         let context = context.clone();
         self.runtime.spawn(async move {
             let emit = |event| {
@@ -1908,6 +1909,14 @@ impl Desktop {
     fn chat_heading(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Chat");
+            if let Some(chat_id) = self.active_chat.as_deref().and_then(ChatStore::chat_id)
+                && ui
+                    .small_button("Copy chat ID")
+                    .on_hover_text("Use the chat ID to find its diagnostic events")
+                    .clicked()
+            {
+                ui.ctx().copy_text(chat_id.to_owned());
+            }
             ui.label(
                 RichText::new(self.config.models.mode.label())
                     .small()

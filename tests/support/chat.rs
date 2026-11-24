@@ -95,7 +95,7 @@ async fn global_auto_approval_runs_and_tracks_terminal_and_mcp_calls() -> Result
         }),
     )?;
     let (sender, entries) = std::sync::mpsc::sync_channel(64);
-    let trace = Trace::new(Some(sender));
+    let trace = Trace::new(Some(sender), None);
     let activity = std::cell::RefCell::new(Vec::new());
     let answer = agent::chat(
         config,
@@ -148,7 +148,7 @@ async fn retry_model_call_after_503_reuses_tool_result() -> Result<()> {
         ..Config::default()
     };
     let (log, entries) = std::sync::mpsc::sync_channel(64);
-    let trace = Trace::new(Some(log));
+    let trace = Trace::new(Some(log), None);
     let retries = std::cell::Cell::new(0);
     let answer = agent::chat(
         config,
@@ -216,9 +216,14 @@ async fn rate_limit_fallback_matches_metadata_and_reuses_tool_results() -> Resul
         },
         ..Config::default()
     };
-    let cooldowns = ModelCooldowns::default();
-    for enabled in [false, true] {
+    for (enabled, eligible) in [(false, true), (true, false), (true, true)] {
         config.model_fallbacks.enabled = enabled;
+        for model in &mut config.model_fallbacks.models {
+            model.free_open = eligible;
+        }
+        let cooldowns = ModelCooldowns::default();
+        let (log, entries) = std::sync::mpsc::sync_channel(128);
+        let trace = Trace::new(Some(log), Some("1234-7-1"));
         let approvals = std::cell::Cell::new(0);
         let switches = std::cell::Cell::new(0);
         let result = agent::chat(
@@ -227,7 +232,7 @@ async fn rate_limit_fallback_matches_metadata_and_reuses_tool_results() -> Resul
             Some(ThinkingSetting::Effort("high".into())),
             TurnSelection::default(),
             &cooldowns,
-            &Trace::default(),
+            &trace,
             |event| match event {
                 Event::Approve(_, reply) => {
                     approvals.set(approvals.get() + 1);
@@ -247,13 +252,41 @@ async fn rate_limit_fallback_matches_metadata_and_reuses_tool_results() -> Resul
         )
         .await;
         assert_eq!(approvals.get(), 1);
-        assert_eq!(switches.get(), usize::from(enabled));
-        if enabled {
+        assert_eq!(switches.get(), usize::from(enabled && eligible));
+        if enabled && eligible {
             assert_eq!(result?, "Reused the tool result");
         } else {
             assert!(format!("{:#}", result.unwrap_err()).contains("429"));
         }
         assert_eq!(cooldowns.active(&config.model_connection()?), enabled);
+        let events: Vec<Value> = entries
+            .try_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?;
+        assert!(events.iter().all(|event| event["chat_id"] == "1234-7-1"));
+        let fallback_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["event"].as_str(),
+                    Some("model_fallback" | "model_fallback_unavailable")
+                )
+            })
+            .collect();
+        assert_eq!(fallback_events.len(), usize::from(enabled));
+        if let Some(event) = fallback_events.first() {
+            let details = &event["details"];
+            assert_eq!(details["http_status"], 429);
+            assert_eq!(details["retry_after_seconds"], 120);
+            if eligible {
+                assert_eq!(event["event"], "model_fallback");
+                assert_eq!(details["from_model"], "rate-limited-fixture");
+                assert_eq!(details["model"], "fallback-ready");
+            } else {
+                assert_eq!(event["event"], "model_fallback_unavailable");
+                assert_eq!(details["model"], "rate-limited-fixture");
+            }
+        }
     }
     Ok(())
 }
@@ -362,7 +395,7 @@ async fn chat_enforces_the_tool_call_limit() -> Result<()> {
         };
         let calls = std::cell::Cell::new(0);
         let (log, entries) = std::sync::mpsc::sync_channel(1024);
-        let trace = Trace::new(Some(log));
+        let trace = Trace::new(Some(log), None);
         let result = agent::chat(
             config.clone(),
             vec![("user".into(), "Run the fixture".into())],

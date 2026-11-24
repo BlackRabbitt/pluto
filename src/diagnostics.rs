@@ -18,6 +18,8 @@ pub struct Entry {
     unix_ms: u128,
     process: u32,
     turn: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_id: Option<String>,
     event: &'static str,
     details: Value,
 }
@@ -26,14 +28,16 @@ pub struct Entry {
 pub struct Trace {
     sender: Option<LogSender>,
     turn: u64,
+    chat_id: Option<String>,
     arguments: RandomState,
 }
 
 impl Trace {
-    pub fn new(sender: Option<LogSender>) -> Self {
+    pub fn new(sender: Option<LogSender>, chat_id: Option<&str>) -> Self {
         Self {
             sender,
             turn: NEXT_TURN.fetch_add(1, Ordering::Relaxed),
+            chat_id: chat_id.map(str::to_owned),
             arguments: RandomState::new(),
         }
     }
@@ -51,6 +55,7 @@ impl Trace {
                     .as_millis(),
                 process: std::process::id(),
                 turn: self.turn,
+                chat_id: self.chat_id.clone(),
                 event,
                 details: details(),
             });
@@ -118,7 +123,7 @@ mod tests {
         let path = directory.join("agent-debug.jsonl");
         let result = (|| {
             File::create(&path)?.set_len(MAX_LOG_BYTES)?;
-            let trace = Trace::new(Some(start(path.clone())?));
+            let trace = Trace::new(Some(start(path.clone())?), Some("1234-7-1"));
             trace.record("tool_finished", || json!({"call": 1}));
             drop(trace);
 
@@ -137,6 +142,7 @@ mod tests {
             };
             let entry: Value = serde_json::from_str(&line)?;
             assert_eq!(entry["event"], "tool_finished");
+            assert_eq!(entry["chat_id"], "1234-7-1");
             assert_eq!(entry["details"]["call"], 1);
             assert_eq!(
                 fs::metadata(path.with_extension("previous.jsonl"))?.len(),

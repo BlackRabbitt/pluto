@@ -33,7 +33,7 @@ Use [README.md](README.md) for setup and user-facing behavior. For dependency wo
 - **Fallback metadata and memory** · Match exact model IDs using the configured provider’s `/models` endpoint. FreeLLM is a discovery link in the README. During fallback selection, read each catalog once and retain metadata only for configured model IDs. Keep catalog reads bounded, scope cooldowns to provider origins, and calculate context fit from borrowed messages and tool definitions.
 - **Widget state** · Scope a reply’s Markdown widgets and nested scroll areas to the chat and message. Keep the composer outside the scrolling history. The layout fixtures check for ID collisions and obscured controls.
 - **Settings and approvals** · MCP add and remove actions stage settings. **Save settings** writes the draft. **Run always** saves a matching rule from the approval dialog. Global auto-approval uses the saved setting at the start of each turn.
-- **Diagnostics** · Queue metadata with `Trace::record`. The background writer serializes and rotates the log. Record tool and model identifiers, decisions, and timings while keeping raw content and credentials out of events.
+- **Diagnostics** · Queue metadata with `Trace::record`. `Desktop::send` attaches the saved chat filename stem as `chat_id`, which stays the same through archive and restore. The background writer serializes and rotates the log. Record identifiers, decisions, and timings while keeping raw content and credentials out of events.
 - **Persisted files** · Check older TOML and chat JSON when adding fields. History tests cover save, reopen, archive, and restore.
 
 ## Verify a change
