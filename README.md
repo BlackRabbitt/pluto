@@ -2,7 +2,16 @@
 
 <img src="assets/pluto-icon.png" alt="Pluto Evergreen icon" width="112" height="112">
 
-Pluto is a free, local-first Rust desktop chatbot for free and open models. Run a model with llama.cpp or Ollama, or connect to an OpenAI-compatible server hosting an open model. Pluto can load skills, run terminal commands, and call MCP tools. Chats are saved as local JSON files.
+Pluto is a free, **local-first desktop agent for open models and coding workflows**. Run an open model on your machine with llama.cpp or Ollama, point Pluto at a model server on your LAN, or opt into an OpenAI-compatible endpoint. Bring the terminal commands, skills, and MCP servers you already use.
+
+## Why Pluto
+
+- **Local by default.** Fresh installs start in **Local only** mode, which sends model requests to your configured llama.cpp or Ollama endpoint. Chats and settings live on disk as JSON and TOML. [Model setup](#connect-a-model) · [Local files](#local-files-and-troubleshooting)
+- **A lightweight Rust desktop client.** On Apple Silicon, the release executable measured **18.6 MiB** on disk and **56 MiB peak resident memory** during a 10-second sandboxed launch on macOS 26.7.3. The build used Rust 1.100.0 and `cargo build --release --locked`. The launch used fresh settings with no model connected. Inference runs in a separate server with its own memory budget. [Desktop entry point](src/main.rs#L110-L131) · [Tested local setup](#tested-local-setup)
+- **Bounded memory for tool output.** Pluto keeps up to 5,500 bytes from each terminal output stream before adding a truncation marker. Large MCP catalogs expose tool schemas on demand, leaving more of the model’s context for your task. [Terminal output capture](src/tools.rs#L928-L965) · [MCP tool discovery](#add-an-mcp-server)
+- **Works with your coding tools.** Set your repository as the terminal working directory and ask Pluto to run a build, a test, or a Git command. Load local `SKILL.md` instructions and connect MCP servers over stdio or Streamable HTTP. Pluto asks before terminal and MCP calls by default. [Skills and tools](#use-skills-and-tools) · [Approvals](#approvals-and-live-activity)
+
+[Get started](#run-pluto) · [Try the example skill](#add-or-update-a-skill) · [Contribute](#contribute)
 
 ## Run Pluto
 
@@ -222,4 +231,6 @@ jq --arg chat_id 'PASTE_CHAT_ID_HERE' 'select(.chat_id == $chat_id)' \
 - To follow tool discovery, look for `tool_requested` with `"tool":"find_tools"`. The `mcp_tools_matched` event lists matched aliases for that batch when there are any. The next `model_request` reports `tools_offered`.
 - For a background job, `tool_finished` with `"outcome":"returned"` marks when the tool returned its response. A status check, if the model requests one, appears as a separate tool call.
 
-For code changes, see the [development guide](DEVELOPMENT.md).
+## Contribute
+
+Tried Pluto with an open model or a coding workflow? Share the model, runtime, OS, and steps you used in a GitHub issue. Reproducible setups and bug reports help others get started. For code contributions, the development guide maps features to their source files and focused tests. [GitHub issues](https://github.com/BlackRabbitt/pluto/issues) · [Development guide](DEVELOPMENT.md)
