@@ -2,7 +2,7 @@
 
 Pluto VM is the optional Alpine Linux sandbox for Pluto, the assistant. Its virtual disk keeps your workspace and conversation between restarts. Connect with Pluto Desktop, the Mac app, or use the API from Terminal.
 
-Already set up? [Update Pluto in your existing VM](#update-pluto-vm).
+[Use Pluto from Terminal](#use-pluto-without-desktop) · [Update Pluto in your existing VM](#update-pluto-vm)
 
 ## Quick start
 
@@ -43,6 +43,8 @@ pluto/vm/vm forward-model 8080
 
 ### 3. Select the VM in Pluto Desktop
 
+You can also go straight to the [Terminal walkthrough](#use-pluto-without-desktop).
+
 Open the installed Pluto Desktop app, or run it from the repository root.
 
 ```sh
@@ -55,20 +57,70 @@ cargo run --locked --manifest-path pluto-desktop/Cargo.toml
 
 Desktop remembers the selected connection. Click **Connect** next to **Standalone** to switch back, or launch with `--vm INSTANCE` or `--standalone` for a one-time override.
 
-Use **New chat** to start a fresh conversation and **Recent chats** to reopen a saved one. A new chat is saved when its first message is sent. All chats share the VM workspace and model settings. Update both Desktop and Pluto VM to use these controls.
+Use **New chat** to start fresh, **Recent chats** to reopen a conversation, or **Archive chat** to move a conversation out of the recent list. Open it under **Archived chats** and click **Restore chat** to continue. Type `/` in the composer to select a skill or MCP tool for the next message.
+
+The VM saves each conversation after its first message. Chats share that VM’s workspace and settings. Update Pluto Desktop and the Pluto service to get the latest chat controls.
 
 If you stop the VM, reopen the model tunnel before chatting. Closing Desktop ends the current turn. Changes a tool already made can persist.
 
 ## Use Pluto without Desktop
 
-Pluto runs as a service inside the VM. Start it from Terminal and read its history to check the connection. A fresh VM returns an empty conversation.
+Run these commands from the repository root on your Mac. Use your VM’s name for `PLUTO_INSTANCE`. Install the VM and configure a model first. For a model running on the Mac, leave its port forward open in another terminal. [Install Pluto VM](#1-install-pluto-vm) · [Configure from Terminal](#configure-from-terminal)
+
+### Start a chat
 
 ```sh
+export PLUTO_INSTANCE=plutoVM  # The default name is pluto
 pluto/vm/vm start
-printf '{"type":"history"}\n' | pluto/vm/vm api
+printf '%s\n' '{"type":"history"}' | pluto/vm/vm api
 ```
 
-Use the same CLI to configure a model and call the API. If your model server runs on the Mac, keep the port forward open while chatting. [Configure from Terminal](#configure-from-terminal) · [VM API](#api)
+A fresh VM returns an empty history. Send a message with `chat_id` set to `null` to start a new chat.
+
+```sh
+{
+  printf '%s\n' '{"type":"send_chat","chat_id":null,"prompt":"Run pwd using the terminal tool and tell me the working directory."}'
+  cat
+} | pluto/vm/vm api
+```
+
+`cat` keeps the input open so you can answer an approval in the same terminal. With auto-approval or a matching saved approval, the tool can run without a prompt.
+
+### Approve a tool call
+
+1. Wait for an event with `"type":"approval"`. Read its `description` and copy its numeric `id`.
+2. Paste the line below into the running command and press Enter. Replace `1` with the event’s ID. To decline, use `false`.
+3. Repeat if Pluto asks about another call. The assistant reply appears in a `history` event. When you see `complete` or `error`, press **Control-D** to finish the command.
+
+```json
+{"type":"decision","id":1,"accept":true}
+```
+
+Use the returned `chat_id` in the next `send_chat` to continue the conversation. Run the same `history` command to look up saved chat IDs.
+
+### Select a skill or MCP tool
+
+List the skills and MCP tools registered in this VM.
+
+```sh
+printf '%s\n' '{"type":"list_skills_and_mcp_tools"}' | pluto/vm/vm api
+```
+
+Copy a skill name from `skills` or a tool’s `server` and `name` from `tools`. Replace the JSON after `printf` in the chat command with one of these examples, using the names returned by your VM. Keep both arrays in `selection` and use an empty array for anything you aren’t selecting.
+
+**Skill**
+
+```json
+{"type":"send_chat","chat_id":null,"prompt":"Use the notes skill to search my test notes for milk.","selection":{"skills":["test-notes"],"mcp":[]}}
+```
+
+**MCP tool**
+
+```json
+{"type":"send_chat","chat_id":null,"prompt":"Call lookup and tell me its exact result.","selection":{"skills":[],"mcp":[{"server":"demo","name":"lookup"}]}}
+```
+
+Selection applies to this message. Answer tool approvals in the same terminal. If an MCP tool is missing, check the response’s `warnings` for connection errors. If you have no skills or servers configured, add them to the VM’s settings file. [Configure from Terminal](#configure-from-terminal) · [API reference](#api)
 
 ## Configure a VM in Desktop
 
@@ -78,7 +130,7 @@ Connect to the instance you want to configure. In **Settings**, the instance nam
 | --- | --- |
 | **Model** | Local or OpenAI-compatible profile, server URL, model catalog, context limit, token environment variable, and hosted fallbacks. Discovery and fallback checks run inside the VM. |
 | **Skills** | Add a folder or `SKILL.md` using an absolute path in the VM. **Import from Mac** copies a portable `SKILL.md` up to 32 KiB. Put scripts and other companion files inside the VM separately. |
-| **MCP servers** | Add, edit, or remove local stdio commands and remote HTTP endpoints. Install local commands inside the VM and set token variables there. |
+| **MCP servers** | Add, edit, or remove local stdio commands and remote HTTP endpoints. Use **Test connection** on the form or **Test** beside a server to view its tools. Both tests run inside the VM. Install local commands and set token variables there. |
 | **Tool approvals** | Choose whether calls ask for approval in this VM. |
 
 Click **Save settings** to apply your changes on the next turn. The service reads its settings file for each turn, so saving doesn’t restart the VM. To use these controls with an older install, update both Pluto Desktop and the Pluto service.
@@ -106,10 +158,23 @@ url = "http://127.0.0.1:8080"
 name = "qwen3.5-27b"
 EOF
 
-pluto/vm/vm configure "$pluto_model_config" && rm "$pluto_model_config"
+pluto/vm/vm configure "$pluto_model_config"
 ```
 
-Use VM paths for registered skills and local MCP commands. Changes to `tools.toml` take effect on the next turn.
+Use VM paths for registered skills and local MCP commands. To try the repo fixtures without Desktop, follow the [file setup commands](#try-the-notes-skill-and-mcp-fixture), then merge these entries into the same TOML file before running `vm configure` again.
+
+```toml
+[skills.test-notes]
+path = "/var/lib/pluto-workspace/tests/test-notes/SKILL.md"
+description = "Search and manage test notes"
+
+[mcp.demo]
+transport = "stdio"
+command = "python3"
+args = ["/var/lib/pluto-workspace/pluto-demo-mcp.py", "stdio"]
+```
+
+Save the TOML file, then rerun `pluto/vm/vm configure "$pluto_model_config"` if you used the example file above. Changes take effect on the next turn.
 
 ## Try the notes skill and MCP fixture
 
@@ -262,17 +327,24 @@ Pluto VM uses 2 CPUs, 512 MiB RAM, and a sparse 4 GiB disk by default. It has ou
 | Action | Message |
 | --- | --- |
 | Read the latest conversation and list saved chats | `{"type":"history"}` |
-| Open a saved chat | `{"type":"open_chat","chat_id":"…"}` |
-| Send to a saved chat or start a fresh one | `{"type":"send_chat","chat_id":"…","prompt":"..."}`. Use `null` for a fresh chat. |
+| Open a saved or archived chat | `{"type":"open_chat","chat_id":"…"}` |
+| Archive or restore a chat | `{"type":"move_chat","chat_id":"…","archive":true}`. Use `false` to restore. |
+| Send to a saved chat or start a fresh one | `{"type":"send_chat","chat_id":"…","prompt":"…"}`. Use `null` for a fresh chat. |
+| List registered skills and discover MCP tools | `{"type":"list_skills_and_mcp_tools"}` returns `skills_and_mcp_tools`. |
+| Read thinking options and context limits for the configured model | `{"type":"model_capabilities"}` |
+| List or forget a saved approval | `{"type":"saved_approvals"}` or `{"type":"forget_approval","rule":{…}}` with a returned rule. |
 | Read model settings | `{"type":"model_settings"}` |
 | Save model settings | `{"type":"save_model_settings","previous":{…},"models":{…}}` |
 | Read or save editable VM settings | `{"type":"vm_settings"}` or `{"type":"save_vm_settings","previous":{…},"settings":{…}}` |
 | Load a model catalog or check fallback metadata | `{"type":"list_models","mode":"local_only","profile":{…}}` or `{"type":"check_fallback_model","model":{…}}` |
+| Test MCP and list exposed tools | `{"type":"test_mcp","server":{…}}` |
 | Validate or import a skill | `{"type":"inspect_skill","path":"/path/in/vm/SKILL.md"}` or `{"type":"import_skill","text":"…"}` |
 | Send to the latest conversation | `{"type":"send","prompt":"..."}` |
 | Answer an `approval` or `retry` event | `{"type":"decision","id":1,"accept":true}` with the event’s ID. Set `accept` to `false` to decline. |
 
-Keep the input stream open during a turn. The service sends history and progress events and finishes with `complete` or `error`. A history response includes the active `chat_id` when a chat exists. The `chats` list contains saved chat IDs and titles, and is included when you open a chat or start a turn. [API types](../src/api.rs)
+The service also accepts the earlier `picker_catalog` request and returns its original response type for existing clients.
+
+Keep the input stream open during a turn. The service sends history and progress events and finishes with `complete` or `error`. A history response includes the active `chat_id` when a chat exists. When you open a chat or start a turn, the response includes `chats` and `archived` summaries. `send_chat` also accepts optional `selection` and `thinking`. For a tool approval that includes a rule, a decision can include `"remember":"exact"` or `"remember":"other_operands"` when the command allows that scope. [API types](../src/api.rs)
 
 ## Verify
 
@@ -280,9 +352,9 @@ The smoke test replaces the model configuration and imports files. Use a disposa
 
 ```sh
 export PLUTO_INSTANCE=pluto-smoke
-pluto/vm/vm setup target/vm/pluto
+pluto/vm/vm install
 python3 -B pluto/tests/vm_smoke.py
 pluto/vm/vm stop
 ```
 
-The fixture checks model settings and stale saves, terminal and MCP tool accounts, approvals, and file and separate chat persistence after a cold restart. For Desktop’s approval buttons, run `cargo test --locked --manifest-path pluto-desktop/Cargo.toml vm_approval_dialog`.
+The fixture checks model settings, skill and MCP selection, tool accounts, context usage, and approval decisions. A cold restart verifies the saved report, recent and archived chats, and saved approvals. Run the [Desktop tests](../../DEVELOPMENT.md#verify-a-change) for the shared controls.

@@ -26,6 +26,7 @@ impl Provider {
     }
 }
 
+#[derive(Deserialize, Serialize)]
 pub struct ThinkingLevel {
     pub label: String,
     pub setting: ThinkingSetting,
@@ -43,7 +44,7 @@ pub struct FallbackMetadata {
     pub paid: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum ThinkingSetting {
     Effort(String),
     Toggle(bool),

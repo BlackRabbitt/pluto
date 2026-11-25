@@ -1,8 +1,12 @@
 use crate::{
+    agent::{TokenUsage, ToolPhase, TurnSelection},
     history::ChatHistory,
     model_fallback::FallbackModel,
-    providers::FallbackMetadata,
-    tools::{ModelMode, ModelProfile, ModelSettings, Skill, VmSettings},
+    providers::{FallbackMetadata, Provider, ThinkingLevel, ThinkingSetting},
+    tools::{
+        ApprovalRule, Mcp, McpToolId, ModelMode, ModelProfile, ModelSettings, Skill, ToolActivity,
+        VmSettings,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -18,6 +22,17 @@ pub enum Request {
     History,
     OpenChat {
         chat_id: String,
+    },
+    MoveChat {
+        chat_id: String,
+        archive: bool,
+    },
+    ListSkillsAndMcpTools,
+    PickerCatalog,
+    ModelCapabilities,
+    SavedApprovals,
+    ForgetApproval {
+        rule: ApprovalRule,
     },
     ModelSettings,
     SaveModelSettings {
@@ -36,6 +51,9 @@ pub enum Request {
     CheckFallbackModel {
         model: FallbackModel,
     },
+    TestMcp {
+        server: Mcp,
+    },
     InspectSkill {
         path: String,
     },
@@ -48,10 +66,16 @@ pub enum Request {
     SendChat {
         chat_id: Option<String>,
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<TurnSelection>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<ThinkingSetting>,
     },
     Decision {
         id: u64,
         accept: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remember: Option<ApprovalScope>,
     },
 }
 
@@ -64,6 +88,8 @@ pub enum Response {
         chat_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chats: Option<Vec<ChatSummary>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<Vec<ChatSummary>>,
     },
     ModelSettings {
         models: ModelSettings,
@@ -71,11 +97,33 @@ pub enum Response {
     VmSettings {
         settings: Box<VmSettings>,
     },
+    SkillsAndMcpTools {
+        skills: Vec<String>,
+        tools: Vec<McpToolId>,
+        warnings: Vec<String>,
+    },
+    PickerCatalog {
+        skills: Vec<String>,
+        tools: Vec<McpToolId>,
+        warnings: Vec<String>,
+    },
+    ModelCapabilities {
+        mode: ModelMode,
+        provider: Option<Provider>,
+        context_window: Option<u64>,
+        thinking: std::result::Result<Vec<ThinkingLevel>, String>,
+    },
+    SavedApprovals {
+        rules: Vec<ApprovalRule>,
+    },
     Models {
         names: Vec<String>,
     },
     FallbackModelMetadata {
         metadata: Option<FallbackMetadata>,
+    },
+    McpTools {
+        names: Vec<String>,
     },
     Skill {
         name: String,
@@ -83,13 +131,21 @@ pub enum Response {
     },
     Status {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update: Option<ChatUpdate>,
     },
     Warning {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update: Option<ChatUpdate>,
     },
     Approval {
         id: u64,
         description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<ApprovalRule>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     Retry {
         id: u64,
@@ -105,6 +161,32 @@ pub enum Response {
 pub struct ChatSummary {
     pub id: String,
     pub title: String,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    Exact,
+    OtherOperands,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatUpdate {
+    Tool {
+        activity: ToolActivity,
+        phase: ToolPhase,
+    },
+    Skill {
+        name: String,
+    },
+    Usage {
+        tokens: Option<TokenUsage>,
+    },
+    ModelSwitch {
+        provider: Provider,
+        context_window: Option<u64>,
+    },
 }
 
 pub async fn read_message<T: DeserializeOwned>(

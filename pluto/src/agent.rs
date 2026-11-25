@@ -90,7 +90,7 @@ pub enum ModelPhase {
     WritingPartialAnswer,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ToolPhase {
     AwaitingApproval,
     Running,
@@ -122,13 +122,13 @@ pub enum ApprovalDecision {
     AutoApproved,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct TurnSelection {
     pub skills: Vec<String>,
     pub mcp: Vec<McpToolId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,

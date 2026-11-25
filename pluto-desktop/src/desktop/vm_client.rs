@@ -1,14 +1,18 @@
 use super::{
-    CommonMarkCache, Desktop, Lookup, chat_message, egui, field, vm_settings::VmSettingsForm,
+    ApprovalDecision, ApprovalRequest, ChatComposer, CommonMarkCache, Desktop, Lookup,
+    PickerCatalog, chat_list, chat_title, chat_transcript, context_usage, egui, field,
+    thinking_picker, tool_approval_dialog, vm_settings::VmSettingsForm,
 };
 use anyhow::{Context, Result, bail, ensure};
 use pluto::{
-    ASSISTANT_NAME,
-    api::{ChatSummary, Request, Response, read_message, write_message},
+    agent::{TokenUsage, ToolProgress, TurnSelection},
+    api::{ApprovalScope, ChatSummary, ChatUpdate, Request, Response, read_message, write_message},
     history::ChatHistory,
-    tools::{Config, valid_name},
+    providers::{Provider, ThinkingLevel, ThinkingSetting},
+    tools::{ApprovalRule, Config, ModelMode, valid_name},
 };
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
     process::Stdio,
@@ -543,8 +547,19 @@ pub(super) struct VmClient {
     history: ChatHistory,
     chat_id: Option<String>,
     chats: Option<Vec<ChatSummary>>,
+    // Older services omit archived summaries and lack the expanded chat API.
+    archived: Option<Vec<ChatSummary>>,
+    capabilities: Lookup<VmCapabilities>,
+    thinking: Option<ThinkingSetting>,
+    context_usage: Option<TokenUsage>,
+    tool_progress: Option<ToolProgress>,
+    switched_model: Option<(Provider, Option<u64>)>,
+    loaded_skills: BTreeMap<usize, BTreeSet<String>>,
+    chat_warnings: Vec<String>,
+    saved_approvals: Lookup<Vec<ApprovalRule>>,
+    pending_send: Option<(String, TurnSelection)>,
     markdown: CommonMarkCache,
-    prompt: String,
+    composer: ChatComposer,
     status: String,
     warning: Option<String>,
     decision: Option<Decision>,
@@ -567,9 +582,18 @@ enum ClientEvent {
 }
 
 struct Decision {
-    description: String,
+    request: ApprovalRequest,
     retry: bool,
-    reply: oneshot::Sender<bool>,
+    error: Option<String>,
+    allow_other_operands: bool,
+    reply: oneshot::Sender<(bool, Option<ApprovalScope>)>,
+}
+
+struct VmCapabilities {
+    mode: ModelMode,
+    provider: Option<Provider>,
+    context_window: Option<u64>,
+    thinking: std::result::Result<Vec<ThinkingLevel>, String>,
 }
 
 impl VmClient {
@@ -594,7 +618,17 @@ impl VmClient {
             chat_id: None,
             chats: None,
             markdown: CommonMarkCache::default(),
-            prompt: String::new(),
+            composer: ChatComposer::default(),
+            archived: None,
+            capabilities: Lookup::Idle,
+            thinking: None,
+            context_usage: None,
+            tool_progress: None,
+            switched_model: None,
+            loaded_skills: BTreeMap::new(),
+            chat_warnings: Vec::new(),
+            saved_approvals: Lookup::Idle,
+            pending_send: None,
             status: String::new(),
             warning: None,
             decision: None,
@@ -616,9 +650,13 @@ impl VmClient {
             self.settings_load_attempted = true;
         }
         self.warning = None;
+        self.tool_progress = None;
         self.status = match &request {
             Request::History => "Connecting to Pluto VM…",
             Request::OpenChat { .. } => "Opening saved chat…",
+            Request::MoveChat { archive: true, .. } => "Archiving chat…",
+            Request::MoveChat { archive: false, .. } => "Restoring chat…",
+            Request::ForgetApproval { .. } => "Removing saved approval…",
             Request::VmSettings => "Loading VM settings…",
             Request::SaveVmSettings { .. } => "Saving VM settings…",
             Request::InspectSkill { .. } | Request::ImportSkill { .. } => "Adding skill…",
@@ -670,15 +708,32 @@ impl VmClient {
         self.settings = false;
         self.chat_id = None;
         self.history = ChatHistory::default();
-        self.markdown = CommonMarkCache::default();
-        self.prompt.clear();
+        self.reset_chat();
         self.warning = None;
     }
 
+    fn reset_chat(&mut self) {
+        self.markdown = CommonMarkCache::default();
+        self.composer.selection = TurnSelection::default();
+        self.composer.picker_catalog = Lookup::Idle;
+        self.context_usage = None;
+        self.switched_model = None;
+        self.loaded_skills.clear();
+        self.chat_warnings.clear();
+    }
+
+    fn archived_chat(&self) -> bool {
+        self.archived
+            .iter()
+            .flatten()
+            .any(|chat| Some(&chat.id) == self.chat_id.as_ref())
+    }
+
     fn chat_navigation(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.ready && !self.busy;
         if ui
             .add_enabled(
-                self.ready && !self.busy && self.chats.is_some(),
+                enabled && self.chats.is_some(),
                 egui::Button::new("New chat"),
             )
             .on_disabled_hover_text(if self.busy {
@@ -690,45 +745,309 @@ impl VmClient {
         {
             self.new_chat();
         }
-        let Some(chats) = self.chats.as_ref().filter(|chats| !chats.is_empty()) else {
-            return;
-        };
-        ui.separator();
-        let mut selected = None;
-        egui::ScrollArea::vertical()
-            .id_salt("vm recent chats")
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Recent chats").weak().small());
-                ui.add_enabled_ui(self.ready && !self.busy, |ui| {
-                    for chat in chats {
-                        let active = self.chat_id.as_ref() == Some(&chat.id);
-                        if ui
-                            .add(
-                                egui::Button::selectable(active && !self.settings, &chat.title)
-                                    .truncate(),
-                            )
-                            .on_hover_text(&chat.title)
-                            .clicked()
-                        {
-                            self.settings = false;
-                            if !active {
-                                selected = Some(chat.id.clone());
-                            }
-                        }
-                    }
-                });
-            });
+        if self.archived.is_some()
+            && !self.settings
+            && let Some(chat_id) = &self.chat_id
+        {
+            let archive = !self.archived_chat();
+            let label = if archive {
+                "Archive chat"
+            } else {
+                "Restore chat"
+            };
+            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                self.request(
+                    Request::MoveChat {
+                        chat_id: chat_id.clone(),
+                        archive,
+                    },
+                    ui.ctx(),
+                );
+            }
+        }
+        let selected = chat_list(
+            ui,
+            self.chats
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|chat| (&chat.id, chat.title.as_str())),
+            self.archived
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|chat| (&chat.id, chat.title.as_str())),
+            self.chat_id.as_ref().filter(|_| !self.settings),
+            enabled,
+        )
+        .cloned();
         if let Some(chat_id) = selected {
-            self.request(Request::OpenChat { chat_id }, ui.ctx());
+            self.settings = false;
+            if self.chat_id.as_ref() != Some(&chat_id) {
+                self.request(Request::OpenChat { chat_id }, ui.ctx());
+            }
         }
     }
 
     fn approval(&mut self, context: &egui::Context) {
-        if let Some(decision) = &self.decision
-            && let Some(answer) = approval_dialog(context, decision)
+        let Some(pending) = self.decision.as_mut().filter(|pending| !pending.retry) else {
+            return;
+        };
+        let (decision, remember) = tool_approval_dialog(
+            context,
+            &pending.request,
+            &mut pending.allow_other_operands,
+            pending.error.as_deref(),
+        );
+        let answer = if remember.is_some() {
+            let scope = if pending.allow_other_operands {
+                ApprovalScope::OtherOperands
+            } else {
+                ApprovalScope::Exact
+            };
+            Some((true, Some(scope)))
+        } else {
+            decision.map(|decision| (!matches!(decision, ApprovalDecision::Decline), None))
+        };
+        if let Some(answer) = answer
             && let Some(decision) = self.decision.take()
         {
+            if answer.1.is_some() {
+                self.saved_approvals = Lookup::Idle;
+            }
             let _ = decision.reply.send(answer);
+        }
+    }
+
+    fn send(&mut self, context: &egui::Context) {
+        if !self.ready
+            || self.busy
+            || self.composer.prompt.trim().is_empty()
+            || self.archived_chat()
+        {
+            return;
+        }
+        if matches!(&self.capabilities, Lookup::Complete(Ok(caps)) if caps.provider.is_none()) {
+            self.settings = true;
+            self.settings_status =
+                Some("Choose a provider, enter its server URL, and select a model.".into());
+            return;
+        }
+        let prompt = std::mem::take(&mut self.composer.prompt);
+        let selection = std::mem::take(&mut self.composer.selection);
+        let request = if self.chats.is_some() {
+            Request::SendChat {
+                chat_id: self.chat_id.clone(),
+                prompt: prompt.clone(),
+                selection: self.archived.is_some().then(|| selection.clone()),
+                thinking: self.thinking.clone(),
+            }
+        } else {
+            Request::Send {
+                prompt: prompt.clone(),
+            }
+        };
+        self.pending_send = Some((prompt, selection));
+        self.composer.picker_catalog = Lookup::Idle;
+        self.chat_warnings.clear();
+        if self.switched_model.take().is_some() {
+            self.context_usage = None;
+        }
+        self.request(request, context);
+    }
+
+    fn load_capabilities(&mut self, context: &egui::Context) {
+        let instance = self.instance.clone();
+        self.capabilities.start(&self.runtime, context, async move {
+            match query_vm_api(instance, Request::ModelCapabilities).await? {
+                Response::ModelCapabilities {
+                    mode,
+                    provider,
+                    context_window,
+                    thinking,
+                } => Ok(VmCapabilities {
+                    mode,
+                    provider,
+                    context_window,
+                    thinking,
+                }),
+                _ => bail!("Unexpected VM model capabilities response"),
+            }
+        });
+    }
+
+    fn chat_ui(&mut self, ui: &mut egui::Ui) {
+        let context = ui.ctx().clone();
+        self.chat_heading(ui);
+        let enabled = self.ready && !self.busy;
+        let archived = self.archived_chat();
+        let picker_enabled = self.archived.is_some();
+        if picker_enabled
+            && self.composer.picker_query(enabled && !archived).is_some()
+            && matches!(self.composer.picker_catalog, Lookup::Idle)
+        {
+            let instance = self.instance.clone();
+            self.composer
+                .picker_catalog
+                .start(&self.runtime, &context, async move {
+                    let response = match query_vm_api(
+                        instance.clone(),
+                        Request::ListSkillsAndMcpTools,
+                    )
+                    .await
+                    {
+                        Err(error)
+                            if error
+                                .to_string()
+                                .contains("unknown variant `list_skills_and_mcp_tools`") =>
+                        {
+                            query_vm_api(instance, Request::PickerCatalog).await?
+                        }
+                        result => result?,
+                    };
+                    match response {
+                        Response::SkillsAndMcpTools {
+                            skills,
+                            tools,
+                            warnings,
+                        }
+                        | Response::PickerCatalog {
+                            skills,
+                            tools,
+                            warnings,
+                        } => Ok(PickerCatalog {
+                            skills,
+                            tools,
+                            warnings,
+                        }),
+                        _ => bail!("Unexpected VM skill and tool catalog response"),
+                    }
+                });
+        }
+        if self
+            .composer
+            .panel(ui, &[], enabled, archived, picker_enabled)
+        {
+            self.send(&context);
+        }
+        let decision = &mut self.decision;
+        let warning = self.warning.as_deref();
+        let status = &self.status;
+        let busy = self.busy;
+        chat_transcript(
+            ui,
+            &self.chat_id,
+            &self.history,
+            &mut self.markdown,
+            &self.chat_warnings,
+            &self.loaded_skills,
+            self.ready,
+            |ui| {
+                if let Some(warning) = warning {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
+                if let Some(retry) = decision.as_ref().filter(|decision| decision.retry) {
+                    if let Some(accept) = super::model_retry_ui(ui, &retry.request.description)
+                        && let Some(decision) = decision.take()
+                    {
+                        let _ = decision.reply.send((accept, None));
+                    }
+                } else if let Some(tool) = &self.tool_progress {
+                    super::tool_progress_ui(ui, tool);
+                } else if busy && !status.is_empty() {
+                    super::chat_progress(ui, status);
+                }
+            },
+        );
+    }
+
+    fn chat_heading(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            chat_title(ui, self.chat_id.as_deref());
+            let mut refresh = false;
+            match &self.capabilities {
+                Lookup::Loading(_) => {
+                    ui.weak("Checking model capabilities…");
+                }
+                Lookup::Complete(Ok(caps)) => {
+                    ui.weak(caps.mode.label());
+                    if caps.provider.is_some() && caps.provider != Some(Provider::OpenAiCompatible)
+                    {
+                        match &caps.thinking {
+                            Ok(levels) if !levels.is_empty() => {
+                                thinking_picker(ui, levels, &mut self.thinking, !self.busy)
+                            }
+                            result => {
+                                let explanation = match result {
+                                    Ok(_) => "The server did not report thinking levels.",
+                                    Err(error) => error,
+                                };
+                                refresh = ui
+                                    .small_button("Refresh thinking levels")
+                                    .on_hover_text(explanation)
+                                    .clicked();
+                            }
+                        }
+                    }
+                }
+                Lookup::Complete(Err(error)) => {
+                    refresh = ui
+                        .small_button("Refresh model capabilities")
+                        .on_hover_text(format!("{error:#}"))
+                        .clicked();
+                }
+                Lookup::Idle => {}
+            }
+            if refresh && self.ready && !self.busy {
+                self.load_capabilities(ui.ctx());
+            }
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Reconnect"))
+                .on_hover_text(&self.instance)
+                .clicked()
+            {
+                self.resources = Lookup::Idle;
+                self.reconnect(ui.ctx());
+            }
+        });
+        let capabilities = match &self.capabilities {
+            Lookup::Complete(Ok(caps)) => (caps.provider, caps.context_window),
+            _ => (None, None),
+        };
+        let (provider, window) = self
+            .switched_model
+            .map(|(provider, window)| (Some(provider), window))
+            .unwrap_or(capabilities);
+        context_usage(
+            ui,
+            provider != Some(Provider::LlamaCpp),
+            window,
+            self.context_usage,
+        );
+    }
+
+    fn chat_update(&mut self, update: ChatUpdate) {
+        match update {
+            ChatUpdate::Tool { activity, phase } => {
+                self.tool_progress = Some(ToolProgress {
+                    activity,
+                    phase,
+                    started: Instant::now(),
+                });
+            }
+            ChatUpdate::Skill { name } => {
+                if let Some(index) = self.history.messages().len().checked_sub(1) {
+                    self.loaded_skills.entry(index).or_default().insert(name);
+                }
+            }
+            ChatUpdate::Usage { tokens } => self.context_usage = tokens,
+            ChatUpdate::ModelSwitch {
+                provider,
+                context_window,
+            } => {
+                self.context_usage = None;
+                self.switched_model = Some((provider, context_window));
+            }
         }
     }
 
@@ -741,7 +1060,13 @@ impl VmClient {
         let action = ui
             .add_enabled_ui(self.ready && !self.busy, |ui| {
                 if let Some(form) = &mut self.settings_form {
-                    form.show(ui, &self.runtime, &self.instance)
+                    form.show(
+                        ui,
+                        &self.runtime,
+                        &self.instance,
+                        &mut self.saved_approvals,
+                        self.archived.is_some(),
+                    )
                 } else {
                     Ok(ui
                         .button("Reload settings")
@@ -843,60 +1168,28 @@ impl VmClient {
     }
 }
 
-fn approval_dialog(context: &egui::Context, decision: &Decision) -> Option<bool> {
-    let mut answer = None;
-    egui::Modal::new(egui::Id::new("vm approval")).show(context, |ui| {
-        ui.set_width(500.0);
-        ui.heading(if decision.retry {
-            "Retry model request?"
-        } else {
-            "Approve tool call"
-        });
-        egui::ScrollArea::vertical()
-            .max_height(260.0)
-            .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&decision.description).monospace())
-                        .wrap()
-                        .selectable(true),
-                );
-            });
-        ui.horizontal(|ui| {
-            if ui
-                .button(if decision.retry {
-                    "Stop turn"
-                } else {
-                    "Decline"
-                })
-                .clicked()
-            {
-                answer = Some(false);
-            }
-            if ui
-                .button(if decision.retry { "Retry" } else { "Run once" })
-                .clicked()
-            {
-                answer = Some(true);
-            }
-        });
-    });
-    answer
-}
-
 impl eframe::App for VmClient {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.composer.picker_catalog.poll();
+        self.capabilities.poll();
+        self.saved_approvals.poll();
         while let Ok(event) = self.events.try_recv() {
             match event {
                 ClientEvent::Response(Response::History {
                     history,
                     chat_id,
                     chats,
+                    archived,
                 }) => {
                     if let Some(chats) = chats {
                         self.chats = Some(chats);
                     }
+                    if let Some(archived) = archived {
+                        self.archived = Some(archived);
+                    }
+                    self.pending_send = None;
                     if self.chat_id != chat_id {
-                        self.markdown = CommonMarkCache::default();
+                        self.reset_chat();
                     }
                     self.chat_id = chat_id;
                     self.history = history;
@@ -908,24 +1201,55 @@ impl eframe::App for VmClient {
                     } else {
                         self.settings_form = Some(VmSettingsForm::new(*settings));
                     }
-                    self.settings_status = Some("VM settings are up to date.".into());
+                    self.capabilities = Lookup::Idle;
+                    self.thinking = None;
+                    self.context_usage = None;
+                    self.switched_model = None;
+                    self.composer.picker_catalog = Lookup::Idle;
+                    self.settings_status = Some("Settings are up to date.".into());
                 }
                 ClientEvent::Response(Response::Skill { name, skill }) => {
                     if let Some(form) = &mut self.settings_form {
                         form.add_skill(name, skill);
                     }
                 }
-                ClientEvent::Response(Response::Status { message }) => self.status = message,
-                ClientEvent::Response(Response::Warning { message }) => {
-                    self.warning = Some(message)
+                ClientEvent::Response(Response::SavedApprovals { rules }) => {
+                    self.saved_approvals = Lookup::Complete(Ok(rules));
+                    self.settings_status = Some("Approval removed".into());
+                }
+                ClientEvent::Response(Response::Status { message, update }) => {
+                    if !message.is_empty() {
+                        self.status = message;
+                        self.tool_progress = None;
+                    }
+                    if let Some(update) = update {
+                        self.chat_update(update);
+                    }
+                }
+                ClientEvent::Response(Response::Warning { message, update }) => {
+                    self.chat_warnings.push(message);
+                    if let Some(update) = update {
+                        self.chat_update(update);
+                    }
                 }
                 ClientEvent::Response(_) => {}
-                ClientEvent::Decision(decision) => self.decision = Some(decision),
+                ClientEvent::Decision(decision) => {
+                    if decision.retry {
+                        self.settings = false;
+                        self.tool_progress = None;
+                    }
+                    self.decision = Some(decision);
+                }
                 ClientEvent::Finished(result) => {
                     self.busy = false;
                     self.decision = None;
+                    self.tool_progress = None;
                     self.status.clear();
                     if let Err(error) = result {
+                        if let Some((prompt, selection)) = self.pending_send.take() {
+                            self.composer.prompt = prompt;
+                            self.composer.selection = selection;
+                        }
                         self.warning = Some(format!("{error:#}"));
                     }
                 }
@@ -943,7 +1267,7 @@ impl eframe::App for VmClient {
         }
         super::navigation_panel(context).show(context, |ui| {
             super::desktop_brand(ui, self.logo.as_ref());
-            ui.weak("Pluto VM");
+            ui.weak(format!("Pluto VM · {}", self.instance));
             ui.add_space(20.0);
             if ui.selectable_label(!self.settings, "Chat").clicked() {
                 self.settings = false;
@@ -954,6 +1278,10 @@ impl eframe::App for VmClient {
                 self.settings = true;
             }
             self.chat_navigation(ui);
+            if let Some(form) = &self.settings_form {
+                let (skills, servers) = form.tool_counts();
+                super::tool_counts_ui(ui, skills, servers);
+            }
         });
         if self.settings {
             if self.ready && !self.busy && !self.settings_load_attempted {
@@ -974,65 +1302,19 @@ impl eframe::App for VmClient {
             return;
         }
         self.usage = VmUsageMonitor::default();
-        egui::TopBottomPanel::bottom("vm composer").show(context, |ui| {
-            self.show_status(ui);
-            ui.add_enabled_ui(self.ready && !self.busy, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.prompt)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Message Pluto"),
-                );
-                if ui
-                    .add_enabled(!self.prompt.trim().is_empty(), egui::Button::new("Send"))
-                    .clicked()
-                {
-                    let prompt = std::mem::take(&mut self.prompt);
-                    let request = if self.chats.is_some() {
-                        Request::SendChat {
-                            chat_id: self.chat_id.clone(),
-                            prompt,
-                        }
-                    } else {
-                        Request::Send { prompt }
-                    };
-                    self.request(request, context);
-                }
-            });
-        });
+        if self.ready
+            && !self.busy
+            && self.archived.is_some()
+            && matches!(self.capabilities, Lookup::Idle)
+        {
+            self.load_capabilities(context);
+        }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::central_panel(&context.style()).inner_margin(egui::Margin::same(24)),
             )
             .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(format!("{ASSISTANT_NAME} · VM"));
-                    ui.label(&self.instance);
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Reconnect"))
-                        .clicked()
-                    {
-                        self.resources = Lookup::Idle;
-                        self.reconnect(context);
-                    }
-                });
-                egui::ScrollArea::vertical()
-                    .id_salt(("vm chat", &self.chat_id))
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        let width = ui.available_width();
-                        for (index, (role, content)) in self.history.messages().iter().enumerate() {
-                            chat_message(
-                                ui,
-                                index,
-                                width,
-                                role,
-                                content,
-                                self.history.timestamp(index),
-                                &mut self.markdown,
-                            );
-                        }
-                    });
+                self.chat_ui(ui);
             });
         self.approval(context);
     }
@@ -1047,7 +1329,13 @@ async fn exchange(
     command.arg("shell");
     if !matches!(
         &request,
-        Request::ListModels { .. } | Request::CheckFallbackModel { .. }
+        Request::ListModels { .. }
+            | Request::CheckFallbackModel { .. }
+            | Request::TestMcp { .. }
+            | Request::ListSkillsAndMcpTools
+            | Request::PickerCatalog
+            | Request::ModelCapabilities
+            | Request::SavedApprovals
     ) {
         command.arg("--start");
     }
@@ -1067,15 +1355,21 @@ async fn exchange(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .context("Could not launch limactl. Install Lima and set up Pluto VM.")?;
     let mut input = child.stdin.take().context("Missing VM input pipe")?;
     let mut output = BufReader::new(child.stdout.take().context("Missing VM output pipe")?);
     write_message(&mut input, &request).await?;
     while let Some(response) = read_message::<Response>(&mut output, 64 * 1024 * 1024).await? {
-        let (id, description, retry) = match response {
-            Response::Approval { id, description } => (id, description, false),
-            Response::Retry { id, description } => (id, description, true),
+        let (id, description, rule, error, retry) = match response {
+            Response::Approval {
+                id,
+                description,
+                rule,
+                error,
+            } => (id, description, rule, error, false),
+            Response::Retry { id, description } => (id, description, None, None, true),
             Response::Complete => return Ok(()),
             Response::Error { message } => {
                 bail!("{}", vm_request_error(instance, &request, message))
@@ -1088,28 +1382,33 @@ async fn exchange(
         };
         let (reply, decision) = oneshot::channel();
         emit(ClientEvent::Decision(Decision {
-            description,
+            request: ApprovalRequest { description, rule },
             retry,
+            error,
+            allow_other_operands: false,
             reply,
         }))
         .map_err(|_| anyhow::anyhow!("Client closed"))?;
         tokio::select! {
-            accept = decision => write_message(&mut input, &Request::Decision { id, accept: accept? }).await?,
+            decision = decision => {
+                let (accept, remember) = decision?;
+                write_message(&mut input, &Request::Decision { id, accept, remember }).await?;
+            }
             status = child.wait() => bail!("Connection closed while waiting for a decision ({})", status?),
         }
     }
     bail!("Disconnected from Pluto VM. Check its status and reconnect.")
 }
 
-pub(super) async fn query_settings(instance: String, request: Request) -> Result<Response> {
+pub(super) async fn query_vm_api(instance: String, request: Request) -> Result<Response> {
     let (sender, events) = mpsc::channel();
     exchange(&instance, request, &|event| sender.send(event)).await?;
     match events
         .try_recv()
-        .context("The VM did not return a settings result")?
+        .context("The VM did not return a response")?
     {
         ClientEvent::Response(response) => Ok(response),
-        _ => bail!("Unexpected response to a VM settings query"),
+        _ => bail!("Unexpected response to a VM API query"),
     }
 }
 
@@ -1117,6 +1416,12 @@ fn vm_request_error(instance: &str, request: &Request, message: String) -> Strin
     if matches!(request, Request::VmSettings) && message.contains("unknown variant `vm_settings`") {
         return format!(
             "{instance} needs a Pluto service update for Skills and MCP settings. From the updated source directory, run: PLUTO_INSTANCE={instance} pluto/vm/vm install. Then click Reload settings."
+        );
+    }
+    if matches!(request, Request::TestMcp { .. }) && message.contains("unknown variant `test_mcp`")
+    {
+        return format!(
+            "Update the Pluto service in {instance} to test MCP connections. From the updated source directory, run: PLUTO_INSTANCE={instance} pluto/vm/vm install."
         );
     }
     let unknown_query = match request {
@@ -1190,6 +1495,42 @@ mod tests {
                 assert_eq!(shown(label), actions.contains(&label), "{label}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn vm_chat_renders_shared_composer_and_archived_state() -> Result<()> {
+        let context = egui::Context::default();
+        let mut desktop = VmClient::disconnected("test".into(), None)?;
+        desktop.ready = true;
+        desktop.chat_id = Some("saved".into());
+        desktop.archived = Some(Vec::new());
+        desktop.composer.prompt = "/".into();
+        desktop.composer.picker_catalog = Lookup::Complete(Ok(PickerCatalog {
+            skills: vec!["report-skill".into()],
+            tools: Vec::new(),
+            warnings: Vec::new(),
+        }));
+        let render = |desktop: &mut VmClient| {
+            context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| desktop.chat_ui(ui));
+            })
+        };
+        let visible = |output: &egui::FullOutput, label| {
+            output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+        })
+        };
+        let output = render(&mut desktop);
+        assert!(visible(&output, "Copy chat ID"));
+        assert!(visible(&output, "report-skill"));
+        desktop.archived = Some(vec![ChatSummary {
+            id: "saved".into(),
+            title: "Earlier chat".into(),
+        }]);
+        let output = render(&mut desktop);
+        assert!(visible(&output, "Archived chat · Restore it to continue"));
+        assert!(!visible(&output, "Send"));
         Ok(())
     }
 
@@ -1416,8 +1757,13 @@ mod tests {
             let mut desktop = VmClient::disconnected("test".into(), None)?;
             desktop.busy = true;
             desktop.decision = Some(Decision {
-                description: "Run awk on the imported CSV".into(),
+                request: ApprovalRequest {
+                    description: "Run awk on the imported CSV".into(),
+                    rule: None,
+                },
                 retry: false,
+                error: None,
+                allow_other_operands: false,
                 reply,
             });
             let mut render = |events| {
@@ -1454,7 +1800,7 @@ mod tests {
                 button(true),
                 button(false),
             ]);
-            assert_eq!(decision.try_recv()?, accept);
+            assert_eq!(decision.try_recv()?.0, accept);
             assert!(desktop.decision.is_none());
         }
         Ok(())

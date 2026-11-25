@@ -29,10 +29,10 @@ To pin Rust for this checkout, run `rustup toolchain install 1.100.0` and `rustu
 | Task | Read first | Focused check |
 | --- | --- | --- |
 | Sidebar, chat layout, Markdown, timestamps, or live activity | [Desktop UI](pluto-desktop/src/desktop.rs) · `Desktop::show_ui`, `chat_message`, `tool_progress_ui` | `chat_layout_tests` |
-| Composer or `/` picker | [Desktop UI](pluto-desktop/src/desktop.rs) · `Desktop::composer_ui`, `Desktop::picker_ui` | `chat_layout_tests` |
+| Composer or `/` picker | [Shared chat UI](pluto-desktop/src/desktop/chat_ui.rs) · `ChatComposer`, `chat_transcript` | `chat_layout_tests` |
 | Saved chats and archive | [History](pluto/src/history.rs) · `ChatHistory`, `ChatStore`. Desktop uses `persist_chat`, `open_chat`, and `move_active_chat`. | `saves_reopens_and_updates_separate_chats` |
 | Settings tabs and manual saves | [Shared tabs](pluto-desktop/src/desktop/settings_tabs.rs), [Desktop UI](pluto-desktop/src/desktop.rs) · `settings_ui`, `save`, `reload_settings`, and [Config](pluto/src/tools.rs). | `standalone_settings_tabs_keep_their_existing_controls` and `mcp_changes_require_an_explicit_save` |
-| MCP setup and connection testing | [Desktop UI](pluto-desktop/src/desktop.rs) · `mcp_draft`, `start_mcp_test`. [Tools](pluto/src/tools.rs) · `Mcp::discover`, `ToolSet::connect`. | `chat_loads_skill_runs_cli_and_calls_both_mcp_transports` |
+| MCP setup and connection testing | [Shared MCP editor](pluto-desktop/src/desktop/mcp_settings.rs) · `McpEditor`, [tools](pluto/src/tools.rs) · `Mcp::discover` | `chat_loads_skill_runs_cli_and_calls_both_mcp_transports` and the [VM smoke test](pluto/vm/README.md#verify) |
 
 ### Harness, models, and tools
 
@@ -53,14 +53,14 @@ To pin Rust for this checkout, run `rustup toolchain install 1.100.0` and `rustu
 | --- | --- | --- |
 | Install, update, or manage the VM | [VM CLI](pluto/vm/vm), [provisioning](pluto/vm/setup-vm.sh), [Lima defaults](pluto/vm/lima.yaml) | [VM smoke test](pluto/vm/README.md#verify) |
 | List VMs, switch modes, or create a VM | [Desktop VM client](pluto-desktop/src/desktop/vm_client.rs) · `DesktopApp`, `VmPicker`. The [Mac installer](pluto-desktop/install-macos.sh) bundles the Pluto build inputs. | `vm_picker` |
-| Start or reopen a VM chat | [Desktop VM client](pluto-desktop/src/desktop/vm_client.rs) · `chat_navigation`, [service](pluto/src/vm.rs) · `Service::session` | `vm_new_chat_clears_the_view_and_keeps_recent_chats` and the [VM smoke test](pluto/vm/README.md#verify) |
+| Start, reopen, archive, or restore a VM chat | [Desktop VM client](pluto-desktop/src/desktop/vm_client.rs) · `chat_navigation`, [service](pluto/src/vm.rs) · `Service::session` | `vm_new_chat_clears_the_view_and_keeps_recent_chats` and the [VM smoke test](pluto/vm/README.md#verify) |
 | VM API, model settings, and approvals | [API types](pluto/src/api.rs), [service](pluto/src/vm.rs) · `Service::session`, [Desktop transport](pluto-desktop/src/desktop/vm_client.rs) · `exchange` | `vm_approval_dialog` and the [VM smoke test](pluto/vm/README.md#verify) |
 | Edit per-VM settings in Desktop | [VM Settings form](pluto-desktop/src/desktop/vm_settings.rs), [configuration](pluto/src/tools.rs) · `VmSettings`, `Config::save_vm_settings` | [VM smoke test](pluto/vm/README.md#verify) |
 | Start, stop, restart, or view VM resource usage from Desktop | [Desktop VM client](pluto-desktop/src/desktop/vm_client.rs) · `VmPower`, `runtime_ui`, `VmUsage` | `vm_runtime` and `vm_usage` |
 
 ## Boundaries to check when changing behavior
 
-- **Chat turns.** `Desktop::send` snapshots standalone settings and history. The VM service loads them in `Service::session`. Both use `agent::chat` and `ChatStore`.
+- **Chat turns.** Both modes share the composer, transcript, history list, and approval controls. `Desktop::send` snapshots standalone settings and history. The VM service loads them in `Service::session`. Both use `agent::chat` and `ChatStore`.
 - **Model routing.** `models.mode` selects `models.local` or `models.openai`. Keep older single-model TOML readable. The OpenAI-compatible route tries its primary, eligible backups, then the saved local profile. Switch within the model loop so tool results, approvals, and the tool-call count carry forward.
 - **Fallback metadata.** Match exact IDs against `/models`. Bound catalog reads, read each provider catalog once per selection, and retain metadata for configured models. Scope cooldowns to provider origins and calculate context fit from borrowed messages and tool definitions.
 - **Settings.** Both modes share the tab and model forms. Standalone settings use a local TOML file. In VM mode, the service reads and saves that instance’s TOML over the API. Model discovery and fallback checks use the VM’s network and token environment. VM saves preserve unrelated fields and reject stale edits. The `vm configure` command replaces the full VM settings file.

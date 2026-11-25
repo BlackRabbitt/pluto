@@ -1,3 +1,5 @@
+mod chat_ui;
+mod mcp_settings;
 mod model_settings;
 mod settings_tabs;
 #[cfg(unix)]
@@ -9,9 +11,15 @@ use agent::{
     ApprovalDecision, Event, ModelPhase, TokenUsage, ToolPhase, ToolProgress, TurnSelection,
 };
 use anyhow::{Context, Result};
+use chat_ui::{
+    ChatComposer, PickerCatalog, chat_list, chat_progress, chat_title, chat_transcript,
+    chat_warning, context_usage, model_retry_ui, saved_approval_list, thinking_picker,
+    tool_approval_dialog,
+};
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use history::{ChatEntry, ChatHistory, ChatStore};
+use mcp_settings::{McpAction, McpEditor};
 use model_fallback::{FallbackSettings, ModelCooldowns};
 use model_settings::{FallbackCheck, ModelCatalog};
 use pluto::{ASSISTANT_NAME, agent, diagnostics, history, model_fallback, providers, tools};
@@ -25,13 +33,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
-use tools::{
-    ApprovalRequest, ApprovalRule, Config, Mcp, McpToolId, ModelMode, ModelSettings, ToolSet,
-};
-
-const CHAT_DRAFT_HEIGHT: f32 = 80.0;
-const CHAT_PICKER_HEIGHT: f32 = 155.0;
-const CHAT_SELECTION_ROWS: usize = 3;
+use tools::{ApprovalRequest, ApprovalRule, Config, ModelMode, ModelSettings, ToolSet};
 
 fn configure_fonts(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -177,6 +179,16 @@ fn desktop_brand(ui: &mut egui::Ui, logo: Option<&egui::TextureHandle>) {
     });
 }
 
+fn tool_counts_ui(ui: &mut egui::Ui, skills: usize, servers: usize) {
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+        ui.label(
+            RichText::new(format!("{skills} skills  ·  {servers} MCP servers"))
+                .weak()
+                .small(),
+        );
+    });
+}
+
 fn chat_message(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
@@ -317,6 +329,7 @@ fn tool_progress_ui(ui: &mut egui::Ui, tool: &ToolProgress) {
 #[cfg(test)]
 mod chat_layout_tests {
     use super::*;
+    use pluto::tools::McpToolId;
 
     #[test]
     fn standalone_settings_tabs_keep_their_existing_controls() -> Result<()> {
@@ -441,7 +454,7 @@ mod chat_layout_tests {
         let send_position = visible_text(&initial, |text| text == "Send", true)
             .context("Send must be visible before entering a draft")?;
         for draft in ["Draft line\n".repeat(80), "Draft line ".repeat(240)] {
-            desktop.prompt = draft;
+            desktop.composer.prompt = draft;
             let output = render(&mut desktop, Vec::new());
             assert_eq!(
                 visible_text(&output, |text| text == "Send", true),
@@ -515,8 +528,9 @@ mod chat_layout_tests {
         desktop.history.push("user", "Show the results".into());
         desktop.history.push("assistant", markdown.into());
         desktop.history.push("assistant", markdown.into());
-        desktop.prompt = "/".into();
-        desktop.picker_catalog = Lookup::Complete(Ok(PickerCatalog {
+        desktop.composer.prompt = "/".into();
+        desktop.composer.picker_catalog = Lookup::Complete(Ok(PickerCatalog {
+            skills: Vec::new(),
             tools: ["fixture", "secondary"]
                 .map(|server| McpToolId {
                     server: server.into(),
@@ -610,9 +624,9 @@ mod chat_layout_tests {
 
         let labels = render(&mut desktop, Vec::new());
         render(&mut desktop, click(find_label(&labels, "test-notes")));
-        assert_eq!(desktop.selection.skills, ["test-notes"]);
+        assert_eq!(desktop.composer.selection.skills, ["test-notes"]);
         render(&mut desktop, vec![egui::Event::Text("/".into())]);
-        assert_eq!(desktop.picker_query(), Some(""));
+        assert_eq!(desktop.composer.picker_query(!desktop.busy), Some(""));
         let labels = render(&mut desktop, Vec::new());
         assert_eq!(
             labels
@@ -622,35 +636,40 @@ mod chat_layout_tests {
             1
         );
         render(&mut desktop, click(find_label(&labels, "summary")));
-        assert_eq!(desktop.selection.skills, ["test-notes", "summary"]);
+        assert_eq!(desktop.composer.selection.skills, ["test-notes", "summary"]);
         let labels = render(&mut desktop, Vec::new());
         for expected in ["test-notes", "summary", "Send"] {
             find_label(&labels, expected);
         }
         render(&mut desktop, click(find_label(&labels, "×")));
-        assert_eq!(desktop.selection.skills, ["summary"]);
-        desktop.prompt = "/".into();
+        assert_eq!(desktop.composer.selection.skills, ["summary"]);
+        desktop.composer.prompt = "/".into();
         let labels = render(&mut desktop, Vec::new());
         render(&mut desktop, click(find_label(&labels, "fixture / lookup")));
-        assert_eq!(desktop.selection.mcp.len(), 1);
+        assert_eq!(desktop.composer.selection.mcp.len(), 1);
         render(&mut desktop, vec![egui::Event::Text("/".into())]);
-        assert_eq!(desktop.picker_query(), Some(""));
+        assert_eq!(desktop.composer.picker_query(!desktop.busy), Some(""));
         let labels = render(&mut desktop, Vec::new());
         render(
             &mut desktop,
             click(find_label(&labels, "secondary / lookup")),
         );
-        assert_eq!(desktop.selection.mcp.len(), 2);
-        assert!(desktop.picker_choices("lookup").is_empty());
-        assert_eq!(desktop.selection.skills, ["summary"]);
+        assert_eq!(desktop.composer.selection.mcp.len(), 2);
+        assert!(
+            desktop
+                .composer
+                .picker_choices(desktop.config.skills.keys(), "lookup")
+                .is_empty()
+        );
+        assert_eq!(desktop.composer.selection.skills, ["summary"]);
         for _ in 0..3 {
             let labels = render(&mut desktop, Vec::new());
             render(&mut desktop, click(find_label(&labels, "×")));
         }
-        assert!(desktop.selection.skills.is_empty());
-        assert!(desktop.selection.mcp.is_empty());
+        assert!(desktop.composer.selection.skills.is_empty());
+        assert!(desktop.composer.selection.mcp.is_empty());
 
-        desktop.prompt.clear();
+        desktop.composer.prompt.clear();
         desktop.busy = true;
         let phases = [
             (ModelPhase::Thinking, "Thinking…"),
@@ -926,32 +945,6 @@ struct PendingApproval {
     error: Option<String>,
 }
 
-struct McpConnectionTest {
-    name: Option<String>,
-    server: Mcp,
-    result: Lookup<Vec<String>>,
-}
-
-struct PickerCatalog {
-    tools: Vec<McpToolId>,
-    warnings: Vec<String>,
-}
-
-#[derive(Clone)]
-enum PickerChoice {
-    Skill(String),
-    Mcp(McpToolId),
-}
-
-impl PickerChoice {
-    fn label(&self) -> String {
-        match self {
-            Self::Skill(name) => name.clone(),
-            Self::Mcp(tool) => format!("{} / {}", tool.server, tool.name),
-        }
-    }
-}
-
 enum ChatStatus {
     Idle,
     Preparing(String),
@@ -987,10 +980,7 @@ struct Desktop {
     active_chat: Option<PathBuf>,
     chat_dirty: bool,
     history_notice: Option<String>,
-    prompt: String,
-    selection: TurnSelection,
-    picker_catalog: Lookup<PickerCatalog>,
-    picker_index: usize,
+    composer: ChatComposer,
     settings: bool,
     settings_page: SettingsPage,
     tool_settings_dirty: bool,
@@ -1007,12 +997,8 @@ struct Desktop {
     approval: Option<PendingApproval>,
     workspace: String,
     skill_path: String,
-    mcp_name: String,
-    mcp_http: bool,
-    mcp_address: String,
-    mcp_details: String,
+    mcp_editor: McpEditor,
     mcp_notice: Option<Result<String>>,
-    mcp_test: Option<McpConnectionTest>,
 }
 
 impl Desktop {
@@ -1132,10 +1118,7 @@ impl Desktop {
             active_chat,
             chat_dirty: false,
             history_notice,
-            prompt: String::new(),
-            selection: TurnSelection::default(),
-            picker_catalog: Lookup::Idle,
-            picker_index: 0,
+            composer: ChatComposer::default(),
             busy: false,
             status: ChatStatus::Idle,
             tool_progress: None,
@@ -1143,17 +1126,13 @@ impl Desktop {
             connection_errors: Vec::new(),
             approval: None,
             skill_path: String::new(),
-            mcp_name: String::new(),
-            mcp_http: true,
-            mcp_address: String::new(),
-            mcp_details: String::new(),
+            mcp_editor: McpEditor::default(),
             mcp_notice: None,
-            mcp_test: None,
         })
     }
 
     fn send(&mut self, context: &egui::Context) {
-        if self.busy || self.prompt.trim().is_empty() || self.active_chat_is_archived() {
+        if self.busy || self.composer.prompt.trim().is_empty() || self.active_chat_is_archived() {
             return;
         }
         if self.config.model_connection().is_err()
@@ -1170,8 +1149,8 @@ impl Desktop {
             self.notice = "Choose a provider, enter its server URL, and select a model.".into();
             return;
         }
-        let selection = std::mem::take(&mut self.selection);
-        self.picker_catalog = Lookup::Idle;
+        let selection = std::mem::take(&mut self.composer.selection);
+        self.composer.picker_catalog = Lookup::Idle;
         self.status = ChatStatus::Preparing(match selection.skills.as_slice() {
             [] => "Discovering tools…".into(),
             [name] => format!("Preparing to load skill · {name}…"),
@@ -1183,7 +1162,8 @@ impl Desktop {
             self.context_usage = None;
         }
         self.busy = true;
-        self.history.push("user", std::mem::take(&mut self.prompt));
+        self.history
+            .push("user", std::mem::take(&mut self.composer.prompt));
         self.chat_dirty = true;
         self.persist_chat();
         let config = self.config.clone();
@@ -1211,227 +1191,25 @@ impl Desktop {
         });
     }
 
-    fn picker_query(&self) -> Option<&str> {
-        if self.busy {
-            return None;
-        }
-        self.prompt
-            .strip_prefix('/')
-            .filter(|query| !query.contains(['/', '\n', '\r']))
-    }
-
-    fn picker_choices(&self, query: &str) -> Vec<PickerChoice> {
-        let query = query.to_lowercase();
-        let matches = |label: &str| {
-            let label = label.to_lowercase();
-            query.split_whitespace().all(|word| label.contains(word))
-        };
-        let mut choices: Vec<_> = self
-            .config
-            .skills
-            .keys()
-            .filter(|name| matches(name) && !self.selection.skills.contains(name))
-            .cloned()
-            .map(PickerChoice::Skill)
-            .collect();
-        if let Lookup::Complete(Ok(catalog)) = &self.picker_catalog {
-            choices.extend(
-                catalog
-                    .tools
-                    .iter()
-                    .filter(|tool| !self.selection.mcp.contains(tool))
-                    .cloned()
-                    .map(PickerChoice::Mcp)
-                    .filter(|selection| matches(&selection.label())),
-            );
-        }
-        choices
-    }
-
-    fn picker_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        input: egui::Id,
-        previous: bool,
-        next: bool,
-        select: bool,
-    ) {
-        if matches!(self.picker_catalog, Lookup::Idle) && !self.config.mcp.is_empty() {
+    fn discover_picker(&mut self, ui: &egui::Ui) {
+        if self.composer.picker_query(!self.busy).is_some()
+            && matches!(self.composer.picker_catalog, Lookup::Idle)
+            && !self.config.mcp.is_empty()
+        {
             let config = self.config.clone();
-            self.picker_catalog
+            self.composer
+                .picker_catalog
                 .start(&self.runtime, ui.ctx(), async move {
                     let mut warnings = Vec::new();
                     let tools = ToolSet::connect(&config, |warning| warnings.push(warning))
                         .await
                         .mcp_tool_choices();
-                    Ok(PickerCatalog { tools, warnings })
+                    Ok(PickerCatalog {
+                        skills: Vec::new(),
+                        tools,
+                        warnings,
+                    })
                 });
-        }
-        let choices = self.picker_choices(self.picker_query().unwrap_or_default());
-        if previous {
-            self.picker_index = self.picker_index.saturating_sub(1);
-        } else if next {
-            self.picker_index = self.picker_index.saturating_add(1);
-        }
-        self.picker_index = self.picker_index.min(choices.len().saturating_sub(1));
-        let mut picked = if select {
-            choices.get(self.picker_index).cloned()
-        } else {
-            None
-        };
-        egui::ScrollArea::vertical()
-            .id_salt("composer_picker")
-            .max_height(CHAT_PICKER_HEIGHT)
-            .show(ui, |ui| {
-                let mut current_group = "";
-                for (index, choice) in choices.iter().enumerate() {
-                    let group = match choice {
-                        PickerChoice::Skill(_) => "Skills",
-                        PickerChoice::Mcp(_) => "MCP tools",
-                    };
-                    if group != current_group {
-                        ui.label(RichText::new(group).small().strong());
-                        current_group = group;
-                    }
-                    let selected = index == self.picker_index;
-                    let row = ui.selectable_label(selected, choice.label());
-                    if row.clicked() {
-                        picked = Some(choice.clone());
-                    }
-                    if selected && (previous || next) {
-                        row.scroll_to_me(None);
-                    }
-                }
-                match &self.picker_catalog {
-                    Lookup::Loading(_) => {
-                        ui.label("Looking up MCP tools…");
-                    }
-                    Lookup::Complete(Ok(catalog)) => {
-                        for warning in &catalog.warnings {
-                            ui.label(
-                                RichText::new(warning)
-                                    .small()
-                                    .color(ui.visuals().warn_fg_color),
-                            );
-                        }
-                    }
-                    Lookup::Complete(Err(error)) => {
-                        ui.label(
-                            RichText::new(format!("{error:#}"))
-                                .small()
-                                .color(ui.visuals().warn_fg_color),
-                        );
-                    }
-                    Lookup::Idle => {}
-                }
-                if choices.is_empty() && !matches!(self.picker_catalog, Lookup::Loading(_)) {
-                    ui.label("No matching skills or MCP tools");
-                }
-            });
-        if let Some(choice) = picked {
-            match choice {
-                PickerChoice::Skill(name) => self.selection.skills.push(name),
-                PickerChoice::Mcp(tool) => self.selection.mcp.push(tool),
-            }
-            self.prompt.clear();
-            self.picker_index = 0;
-            ui.memory_mut(|memory| memory.request_focus(input));
-        }
-    }
-
-    fn selection_height(&self, ui: &egui::Ui) -> f32 {
-        let count = self.selection.skills.len() + self.selection.mcp.len();
-        let rows = count.min(CHAT_SELECTION_ROWS);
-        rows as f32 * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y)
-    }
-
-    fn composer_ui(&mut self, ui: &mut egui::Ui) {
-        if self.active_chat_is_archived() {
-            ui.label(RichText::new("Archived chat · Restore it to continue").weak());
-            return;
-        }
-        let input_id = ui.make_persistent_id("chat_composer");
-        let selection_height = self.selection_height(ui);
-        if selection_height > 0.0 {
-            let removed = egui::ScrollArea::vertical()
-                .id_salt("composer_selection")
-                .max_height(selection_height - ui.spacing().item_spacing.y)
-                .min_scrolled_height(0.0)
-                .show(ui, |ui| {
-                    let mut removed = false;
-                    let mut keep_row = |label: &str| {
-                        let remove = ui
-                            .horizontal(|ui| {
-                                let remove = ui
-                                    .small_button("×")
-                                    .on_hover_text(format!("Remove {label}"))
-                                    .clicked();
-                                ui.add(egui::Label::new(label).truncate());
-                                remove
-                            })
-                            .inner;
-                        removed |= remove;
-                        !remove
-                    };
-                    self.selection.skills.retain(|name| keep_row(name));
-                    self.selection
-                        .mcp
-                        .retain(|tool| keep_row(&format!("{} / {}", tool.server, tool.name)));
-                    removed
-                })
-                .inner;
-            if removed {
-                ui.memory_mut(|memory| memory.request_focus(input_id));
-            }
-        }
-        let mut keys = (false, false, false, false);
-        if self.picker_query().is_some() && ui.memory(|memory| memory.has_focus(input_id)) {
-            keys = ui.input_mut(|input| {
-                (
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-                )
-            });
-        }
-        let (previous, next, select, cancel) = keys;
-        if cancel {
-            self.prompt.clear();
-        }
-        let input = egui::ScrollArea::vertical()
-            .id_salt("composer_draft")
-            .max_height(CHAT_DRAFT_HEIGHT)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_enabled(
-                    !self.busy,
-                    TextEdit::multiline(&mut self.prompt)
-                        .id(input_id)
-                        .hint_text("Message Pluto or type / to pick a skill or tool")
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                )
-            })
-            .inner;
-        if input.changed() {
-            self.picker_index = 0;
-        }
-        if self.picker_query().is_some() {
-            self.picker_ui(ui, input_id, previous, next, select);
-            return;
-        }
-        if self.selection.skills.is_empty() && self.selection.mcp.is_empty() {
-            self.picker_catalog = Lookup::Idle;
-        }
-        let keyboard = input.has_focus()
-            && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
-        if ui
-            .add_enabled(!self.busy, egui::Button::new("Send"))
-            .clicked()
-            || keyboard
-        {
-            self.send(ui.ctx());
         }
     }
 
@@ -1475,8 +1253,8 @@ impl Desktop {
             ChatHistory::default()
         };
         self.active_chat = path;
-        self.selection = TurnSelection::default();
-        self.picker_catalog = Lookup::Idle;
+        self.composer.selection = TurnSelection::default();
+        self.composer.picker_catalog = Lookup::Idle;
         self.history = history;
         self.loaded_skills.clear();
         self.context_usage = None;
@@ -1488,38 +1266,18 @@ impl Desktop {
     }
 
     fn saved_chats_ui(&mut self, ui: &mut egui::Ui) {
-        if self.saved_chats.is_empty() && self.archived_chats.is_empty() {
-            return;
-        }
-        ui.separator();
-        let max_height = (ui.available_height() - 42.0).max(0.0);
-        let mut selected = None;
-        let mut chat_list = |ui: &mut egui::Ui, chats: &[ChatEntry]| {
-            for chat in chats {
-                let active = !self.settings && self.active_chat.as_ref() == Some(&chat.path);
-                if ui
-                    .add(egui::Button::selectable(active, &chat.title).truncate())
-                    .on_hover_text(&chat.title)
-                    .clicked()
-                {
-                    selected = Some(chat.path.clone());
-                }
-            }
-        };
-        egui::ScrollArea::vertical()
-            .max_height(max_height)
-            .show(ui, |ui| {
-                ui.add_enabled_ui(!self.busy, |ui| {
-                    if !self.saved_chats.is_empty() {
-                        ui.label(RichText::new("Recent chats").weak().small());
-                        chat_list(ui, &self.saved_chats);
-                    }
-                    if !self.archived_chats.is_empty() {
-                        egui::CollapsingHeader::new("Archived chats")
-                            .show(ui, |ui| chat_list(ui, &self.archived_chats));
-                    }
-                });
-            });
+        let selected = chat_list(
+            ui,
+            self.saved_chats
+                .iter()
+                .map(|chat| (&chat.path, chat.title.as_str())),
+            self.archived_chats
+                .iter()
+                .map(|chat| (&chat.path, chat.title.as_str())),
+            self.active_chat.as_ref().filter(|_| !self.settings),
+            !self.busy,
+        )
+        .cloned();
         if let Some(path) = selected {
             self.open_chat(Some(path));
         }
@@ -1559,7 +1317,7 @@ impl Desktop {
                 entry.path = new_path.clone();
                 destination.insert(0, entry);
                 self.active_chat = Some(new_path);
-                self.picker_catalog = Lookup::Idle;
+                self.composer.picker_catalog = Lookup::Idle;
                 self.history_notice = None;
             }
             Err(error) => self.history_notice = Some(format!("{error:#}")),
@@ -1618,12 +1376,9 @@ impl Desktop {
                 self.model_catalog = ModelCatalog::default();
                 self.fallback_check = None;
                 self.skill_path.clear();
-                self.mcp_name.clear();
-                self.mcp_address.clear();
-                self.mcp_details.clear();
+                self.mcp_editor = McpEditor::default();
                 self.mcp_notice = None;
-                self.mcp_test = None;
-                self.picker_catalog = Lookup::Idle;
+                self.composer.picker_catalog = Lookup::Idle;
                 self.notice = "Settings reloaded".into();
             }
             Err(error) => self.notice = format!("Could not reload settings: {error:#}"),
@@ -1649,32 +1404,21 @@ impl Desktop {
     }
 
     fn saved_approvals_ui(&mut self, ui: &mut egui::Ui) {
-        if self.config.terminal_approvals.is_empty() && self.config.mcp_approvals.is_empty() {
-            return;
-        }
-        let mut forget = None;
-        egui::CollapsingHeader::new("Saved approvals").show(ui, |ui| {
-            let cli = self
-                .config
-                .terminal_approvals
-                .iter()
-                .cloned()
-                .map(ApprovalRule::Terminal);
-            let mcp = self
-                .config
-                .mcp_approvals
-                .iter()
-                .cloned()
-                .map(ApprovalRule::Mcp);
-            for rule in cli.chain(mcp) {
-                ui.horizontal(|ui| {
-                    if ui.small_button("Forget").clicked() {
-                        forget = Some(rule.clone());
-                    }
-                    ui.add(egui::Label::new(RichText::new(rule.label()).monospace()).wrap());
-                });
-            }
-        });
+        let rules: Vec<_> = self
+            .config
+            .terminal_approvals
+            .iter()
+            .cloned()
+            .map(ApprovalRule::Terminal)
+            .chain(
+                self.config
+                    .mcp_approvals
+                    .iter()
+                    .cloned()
+                    .map(ApprovalRule::Mcp),
+            )
+            .collect();
+        let forget = saved_approval_list(ui, rules.iter());
         if let Some(rule) = forget {
             self.notice = match self.update_approvals(|saved| saved.forget_approval(&rule)) {
                 Ok(()) => "Approval removed".into(),
@@ -1687,68 +1431,12 @@ impl Desktop {
         let Some(pending) = &mut self.approval else {
             return;
         };
-        let mut decision = None;
-        let mut remember = None;
-        egui::Modal::new(egui::Id::new("approval")).show(context, |ui| {
-            ui.set_width(500.0);
-            ui.heading("Approve tool call");
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(&pending.request.description).monospace())
-                            .wrap()
-                            .selectable(true),
-                    );
-                });
-            let scope = pending.request.rule.as_ref().map(|rule| {
-                let ApprovalRule::Terminal(exact) = rule else {
-                    ui.label(RichText::new(
-                        "Run always approves this tool on this server, including calls with different arguments."
-                    ).small());
-                    return rule.clone();
-                };
-                let similar = exact.allow_other_operands();
-                if similar.is_some() {
-                    ui.checkbox(
-                        &mut pending.allow_other_operands,
-                        "Allow different values after --",
-                    );
-                }
-                let selected = match similar.filter(|_| pending.allow_other_operands) {
-                    Some(rule) => {
-                        ui.label(RichText::new(rule.label()).monospace().small());
-                        rule
-                    }
-                    None => {
-                        ui.label(
-                            RichText::new(
-                                "Run always saves this exact command and working directory.",
-                            )
-                            .small(),
-                        );
-                        exact.clone()
-                    }
-                };
-                ApprovalRule::Terminal(selected)
-            });
-            if let Some(error) = &pending.error {
-                ui.label(RichText::new(error).color(ui.visuals().warn_fg_color));
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Decline").clicked() {
-                    decision = Some(ApprovalDecision::Decline);
-                }
-                if ui.button("Run once").clicked() {
-                    decision = Some(ApprovalDecision::RunOnce);
-                }
-                if let Some(rule) = scope
-                    && ui.button("Run always").clicked()
-                {
-                    remember = Some(rule);
-                }
-            });
-        });
+        let (mut decision, remember) = tool_approval_dialog(
+            context,
+            &pending.request,
+            &mut pending.allow_other_operands,
+            pending.error.as_deref(),
+        );
         if let Some(rule) = remember {
             match self.update_approvals(|saved| saved.remember_approval(rule)) {
                 Ok(()) => decision = Some(ApprovalDecision::RunOnce),
@@ -1829,15 +1517,7 @@ impl Desktop {
 
     fn chat_heading(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Chat");
-            if let Some(chat_id) = self.active_chat.as_deref().and_then(ChatStore::chat_id)
-                && ui
-                    .small_button("Copy chat ID")
-                    .on_hover_text("Use the chat ID to find its diagnostic events")
-                    .clicked()
-            {
-                ui.ctx().copy_text(chat_id.to_owned());
-            }
+            chat_title(ui, self.active_chat.as_deref().and_then(ChatStore::chat_id));
             ui.label(
                 RichText::new(self.config.models.mode.label())
                     .small()
@@ -1869,29 +1549,7 @@ impl Desktop {
             let refresh = match thinking {
                 None => true,
                 Some(Ok(levels)) if !levels.is_empty() => {
-                    let label = levels
-                        .iter()
-                        .find(|level| self.thinking_setting.as_ref() == Some(&level.setting))
-                        .map_or("Server default", |level| level.label.as_str());
-                    ui.label("Thinking");
-                    ui.add_enabled_ui(!self.busy, |ui| {
-                        egui::ComboBox::from_id_salt("thinking_level")
-                            .selected_text(label)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.thinking_setting,
-                                    None,
-                                    "Server default",
-                                );
-                                for level in levels {
-                                    ui.selectable_value(
-                                        &mut self.thinking_setting,
-                                        Some(level.setting.clone()),
-                                        &level.label,
-                                    );
-                                }
-                            });
-                    });
+                    thinking_picker(ui, levels, &mut self.thinking_setting, !self.busy);
                     false
                 }
                 Some(result) => {
@@ -1946,118 +1604,7 @@ impl Desktop {
         } else {
             reported_window
         };
-        let units = if input_only { "input tokens" } else { "tokens" };
-        let Some(usage) = self.context_usage else {
-            if let Some(window) = window {
-                ui.label(RichText::new(format!("Context window · {window} {units}")).small());
-            }
-            return;
-        };
-        let details = format!(
-            "Last model request\nInput: {} tokens\nOutput: {} tokens",
-            usage.input, usage.output
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Context").small().strong());
-            if let Some(window) = window {
-                let used = if input_only {
-                    usage.input
-                } else {
-                    usage.total()
-                };
-                let fraction = used as f64 / window as f64;
-                let fill = if fraction >= 0.9 {
-                    ui.visuals().warn_fg_color
-                } else {
-                    ui.visuals().hyperlink_color
-                };
-                ui.add(
-                    egui::ProgressBar::new(fraction.min(1.0) as f32)
-                        .desired_width(112.0)
-                        .fill(fill),
-                )
-                .on_hover_text(&details);
-                ui.label(RichText::new(format!("{used} / {window} {units}")).small())
-                    .on_hover_text(&details);
-            } else {
-                ui.label(RichText::new(format!("{} tokens · last request", usage.total())).small())
-                    .on_hover_text(format!("{details}\nContext limit unavailable"));
-            }
-        });
-    }
-
-    fn mcp_draft(&self) -> Mcp {
-        let target = self.mcp_address.trim().to_owned();
-        if self.mcp_http {
-            Mcp::Http {
-                url: target,
-                token_env: self.mcp_details.trim().into(),
-            }
-        } else {
-            Mcp::Stdio {
-                command: target,
-                args: self
-                    .mcp_details
-                    .lines()
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-            }
-        }
-    }
-
-    fn add_mcp(&mut self, server: Mcp) -> Result<String> {
-        let name = self.mcp_name.trim().to_owned();
-        self.config.set_mcp_server(&name, Some(server))?;
-        if let Some(test) = &mut self.mcp_test
-            && test.name.is_none()
-            && self.config.mcp.get(&name) == Some(&test.server)
-        {
-            test.name = Some(name.clone());
-        }
-        self.mcp_name.clear();
-        self.mcp_address.clear();
-        self.mcp_details.clear();
-        Ok(format!("Added {name}. Click Save settings to keep it."))
-    }
-
-    fn start_mcp_test(&mut self, context: &egui::Context, name: Option<String>, server: Mcp) {
-        let mut result = Lookup::Idle;
-        let connection = server.clone();
-        result.start(&self.runtime, context, async move {
-            connection.test_connection().await
-        });
-        self.mcp_test = Some(McpConnectionTest {
-            name,
-            server,
-            result,
-        });
-    }
-
-    fn mcp_test_status(&self, ui: &mut egui::Ui, name: Option<&str>, server: &Mcp) {
-        let Some(test) = &self.mcp_test else { return };
-        if test.name.as_deref() != name || &test.server != server {
-            return;
-        }
-        match &test.result {
-            Lookup::Idle => {}
-            Lookup::Loading(_) => {
-                ui.label("Testing connection…");
-            }
-            Lookup::Complete(Ok(tools)) => {
-                ui.label(format!("Connected · {} tools found", tools.len()));
-                if !tools.is_empty() {
-                    let names = tools[..tools.len().min(6)].join(", ");
-                    ui.label(RichText::new(names).weak());
-                }
-            }
-            Lookup::Complete(Err(error)) => {
-                ui.label(
-                    RichText::new(format!("Connection failed: {error:#}"))
-                        .color(ui.visuals().warn_fg_color),
-                );
-            }
-        }
+        context_usage(ui, input_only, window, self.context_usage);
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -2166,100 +1713,34 @@ impl Desktop {
     }
 
     fn standalone_mcp_ui(&mut self, ui: &mut egui::Ui) {
-        let mut remove = None;
-        let mut test_request = None;
-        let testing = self
-            .mcp_test
-            .as_ref()
-            .is_some_and(|test| matches!(test.result, Lookup::Loading(_)));
-        for (name, server) in &self.config.mcp {
-            ui.horizontal(|ui| {
-                let target = match server {
-                    Mcp::Http { url, .. } => url,
-                    Mcp::Stdio { command, .. } => command,
-                };
-                ui.label(RichText::new(name).strong()).on_hover_text(target);
-                if ui
-                    .add_enabled(!testing, egui::Button::new("Test"))
-                    .clicked()
-                {
-                    test_request = Some((name.clone(), server.clone()));
-                }
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(name.clone());
-                }
-            });
-            self.mcp_test_status(ui, Some(name), server);
-        }
-        if let Some((name, server)) = test_request {
-            self.start_mcp_test(ui.ctx(), Some(name), server);
-        }
-        if let Some(name) = remove {
-            let result = self.config.set_mcp_server(&name, None);
-            self.tool_settings_dirty |= result.is_ok();
-            self.mcp_notice = Some(
-                result.map(|()| format!("Removed {name}. Click Save settings to keep the change.")),
-            );
-        }
-        ui.horizontal(|ui| {
-            if ui.selectable_label(self.mcp_http, "Remote HTTP").clicked() && !self.mcp_http {
-                self.mcp_http = true;
-                self.mcp_address.clear();
-                self.mcp_details.clear();
+        match self.mcp_editor.show(ui, &self.config.mcp, false) {
+            Some(McpAction::Test(name, server)) => {
+                let connection = server.clone();
+                self.mcp_editor
+                    .start_test(&self.runtime, ui.ctx(), name, server, async move {
+                        connection.test_connection().await
+                    });
             }
-            if ui
-                .selectable_label(!self.mcp_http, "Local process")
-                .clicked()
-                && self.mcp_http
-            {
-                self.mcp_http = false;
-                self.mcp_address.clear();
-                self.mcp_details.clear();
-            }
-        });
-        field(ui, "Server name", &mut self.mcp_name, "notes");
-        if self.mcp_http {
-            field(
-                ui,
-                "MCP endpoint URL",
-                &mut self.mcp_address,
-                "https://example.com/mcp",
-            );
-            field(
-                ui,
-                "Bearer token environment variable",
-                &mut self.mcp_details,
-                "Optional",
-            );
-        } else {
-            field(
-                ui,
-                "Launch command",
-                &mut self.mcp_address,
-                "An executable on PATH",
-            );
-            ui.label("Arguments (one per line)");
-            ui.add(
-                TextEdit::multiline(&mut self.mcp_details)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(3),
-            );
-        }
-        let draft = self.mcp_draft();
-        ui.horizontal(|ui| {
-            if ui.button("Add MCP server").clicked() {
-                let result = self.add_mcp(draft.clone());
+            Some(McpAction::Remove(name)) => {
+                let result = self.config.set_mcp_server(&name, None);
                 self.tool_settings_dirty |= result.is_ok();
-                self.mcp_notice = Some(result);
+                self.mcp_notice =
+                    Some(result.map(|()| {
+                        format!("Removed {name}. Click Save settings to keep the change.")
+                    }));
             }
-            if ui
-                .add_enabled(!testing, egui::Button::new("Test connection"))
-                .clicked()
-            {
-                self.start_mcp_test(ui.ctx(), None, draft.clone());
+            Some(McpAction::Save(name, server)) => {
+                let result = self.config.set_mcp_server(&name, Some(server.clone()));
+                if result.is_ok() {
+                    self.mcp_editor.applied(&name, &server);
+                    self.tool_settings_dirty = true;
+                }
+                self.mcp_notice = Some(
+                    result.map(|()| format!("Click Save settings to keep changes to {name}.")),
+                );
             }
-        });
-        self.mcp_test_status(ui, None, &draft);
+            None => {}
+        }
         if let Some(notice) = &self.mcp_notice {
             match notice {
                 Ok(message) => ui.label(message),
@@ -2283,10 +1764,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> egui
 impl eframe::App for Desktop {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.capabilities.poll();
-        self.picker_catalog.poll();
-        if let Some(test) = &mut self.mcp_test {
-            test.result.poll();
-        }
+        self.composer.picker_catalog.poll();
         self.sync_discovery();
         while let Ok(event) = self.events.try_recv() {
             match event {
@@ -2399,20 +1877,13 @@ impl Desktop {
                 }
             }
             self.saved_chats_ui(ui);
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                let counts = format!(
-                    "{} skills  ·  {} MCP servers",
-                    self.config.skills.len(),
-                    self.config.mcp.len()
-                );
-                ui.label(RichText::new(counts).weak().small());
-            });
+            tool_counts_ui(ui, self.config.skills.len(), self.config.mcp.len());
         });
         egui::CentralPanel::default()
             .frame(Frame::central_panel(&context.style()).inner_margin(Margin::same(24)))
             .show(context, |ui| {
                 if self.settings {
-                    self.picker_catalog = Lookup::Idle;
+                    self.composer.picker_catalog = Lookup::Idle;
                     egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui));
                     return;
                 }
@@ -2425,77 +1896,27 @@ impl Desktop {
                         self.persist_chat();
                     }
                 }
-                let spacing = ui.spacing().item_spacing.y;
-                let row = ui.spacing().interact_size.y;
-                let composer_height = if self.active_chat_is_archived() {
-                    row + spacing
-                } else {
-                    let actions = if self.picker_query().is_some() {
-                        CHAT_PICKER_HEIGHT
-                    } else {
-                        row
-                    };
-                    self.selection_height(ui) + CHAT_DRAFT_HEIGHT + actions + 2.0 * spacing
-                };
-                egui::TopBottomPanel::bottom("chat_composer_panel")
-                    .exact_height(composer_height)
-                    .show_separator_line(false)
-                    .frame(Frame::new().inner_margin(Margin {
-                        top: spacing as i8,
-                        ..Margin::ZERO
-                    }))
-                    .show_inside(ui, |ui| self.composer_ui(ui));
-                egui::ScrollArea::vertical()
-                    .id_salt(&self.active_chat)
-                    .stick_to_bottom(true)
-                    .min_scrolled_height(0.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for warning in &self.connection_errors {
-                            ui.label(RichText::new(warning).color(ui.visuals().warn_fg_color));
-                        }
-                        if self.history.messages().is_empty() {
-                            ui.add_space(52.0);
-                            ui.label(RichText::new("What would you like to do?").size(25.0));
-                        }
-                        let column_width = ui.available_width().min(ui.clip_rect().width());
-                        for (index, (role, content)) in self.history.messages().iter().enumerate() {
-                            chat_message(
-                                ui,
-                                (&self.active_chat, index),
-                                column_width,
-                                role,
-                                content,
-                                self.history.timestamp(index),
-                                &mut self.markdown_cache,
-                            );
-                            if let Some(skills) = self.loaded_skills.get(&index) {
-                                for name in skills {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(format!("Skill loaded · {name}"))
-                                                .small()
-                                                .color(ui.visuals().hyperlink_color),
-                                        )
-                                        .wrap(),
-                                    );
-                                }
-                            }
-                        }
+                self.discover_picker(ui);
+                let skills = self.config.skills.keys().cloned().collect::<Vec<_>>();
+                let archived = self.active_chat_is_archived();
+                if self.composer.panel(ui, &skills, !self.busy, archived, true) {
+                    self.send(context);
+                }
+                chat_transcript(
+                    ui,
+                    &self.active_chat,
+                    &self.history,
+                    &mut self.markdown_cache,
+                    &self.connection_errors,
+                    &self.loaded_skills,
+                    true,
+                    |ui| {
                         if let Some(tool) = &self.tool_progress {
                             tool_progress_ui(ui, tool);
                         } else {
                             match &self.status {
                                 ChatStatus::Idle => {}
-                                ChatStatus::Preparing(status) => {
-                                    ui.horizontal_top(|ui| {
-                                        ui.spinner();
-                                        ui.add(
-                                            egui::Label::new(RichText::new(status).small().weak())
-                                                .wrap(),
-                                        );
-                                    });
-                                }
+                                ChatStatus::Preparing(status) => chat_progress(ui, status),
                                 ChatStatus::ModelRequest(phase) => {
                                     let label = match phase {
                                         ModelPhase::Thinking => "Thinking…",
@@ -2506,52 +1927,28 @@ impl Desktop {
                                             "Writing a partial answer…"
                                         }
                                     };
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.add(
-                                            egui::Label::new(RichText::new(label).small()).wrap(),
-                                        );
-                                    });
+                                    chat_progress(ui, label);
                                 }
-                                ChatStatus::ModelRequestFailed(status, _)
-                                | ChatStatus::Error(status) => {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(status)
-                                                .small()
-                                                .color(ui.visuals().warn_fg_color),
-                                        )
-                                        .wrap(),
-                                    );
-                                    if matches!(self.status, ChatStatus::ModelRequestFailed(..)) {
-                                        let (retry, end_turn) = ui
-                                            .horizontal_wrapped(|ui| {
-                                                (
-                                                    ui.button("Retry model call").clicked(),
-                                                    ui.button("End turn").clicked(),
-                                                )
-                                            })
-                                            .inner;
-                                        if retry || end_turn {
-                                            let next_status = if retry {
-                                                ChatStatus::Preparing(
-                                                    "Retrying model request…".into(),
-                                                )
-                                            } else {
-                                                ChatStatus::Idle
-                                            };
-                                            if let ChatStatus::ModelRequestFailed(_, decision) =
-                                                std::mem::replace(&mut self.status, next_status)
-                                                && retry
-                                            {
-                                                let _ = decision.send(());
-                                            }
+                                ChatStatus::Error(status) => chat_warning(ui, status),
+                                ChatStatus::ModelRequestFailed(status, _) => {
+                                    if let Some(retry) = model_retry_ui(ui, status) {
+                                        let next = if retry {
+                                            ChatStatus::Preparing("Retrying model request…".into())
+                                        } else {
+                                            ChatStatus::Idle
+                                        };
+                                        if let ChatStatus::ModelRequestFailed(_, decision) =
+                                            std::mem::replace(&mut self.status, next)
+                                            && retry
+                                        {
+                                            let _ = decision.send(());
                                         }
                                     }
                                 }
                             }
                         }
-                    });
+                    },
+                );
             });
         self.approval_ui(context);
     }

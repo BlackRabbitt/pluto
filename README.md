@@ -33,7 +33,7 @@ To install the default VM from Terminal, run this from the repository root:
 pluto/vm/vm install
 ```
 
-Run the same install command to apply the source in your checkout. Use `pluto/vm/vm install --latest` from a Git checkout with an upstream to install that branch’s latest source. [VM updates](pluto/vm/README.md#update-pluto-vm) · [Manual builds](pluto/vm/README.md#build-manually-from-source) · [VM API](pluto/vm/README.md#api)
+Run the same install command to apply the source in your checkout. Use `pluto/vm/vm install --latest` from a Git checkout with an upstream to install that branch’s latest source. [VM updates](pluto/vm/README.md#update-pluto-vm) · [Manual builds](pluto/vm/README.md#build-manually-from-source) · [Use Pluto from Terminal](pluto/vm/README.md#use-pluto-without-desktop) · [VM API](pluto/vm/README.md#api)
 
 You can also [use Pluto from Terminal](pluto/vm/README.md#use-pluto-without-desktop) or [rename an existing instance to `plutoVM`](pluto/vm/README.md#name-or-rename-a-vm).
 
@@ -107,15 +107,13 @@ Source installs use ad hoc signing by default, so macOS can ask again after a re
 
 ## Chat
 
-In Pluto VM, click **New chat** for a fresh conversation. Reopen earlier conversations under **Recent chats**. The VM saves each conversation on its own disk and shares the workspace across chats.
-
-The controls below are for standalone Desktop.
+Both modes use the same chat controls. Click **New chat** to start fresh, or use **Recent chats** and **Archived chats** to reopen a conversation. Each VM keeps its own chats, approvals, and workspace. Update Pluto Desktop and the Pluto service to get the full set of VM chat controls. [VM updates](pluto/vm/README.md#update-pluto-vm)
 
 - Use the **Thinking** menu to select a level or toggle when llama.cpp or Ollama reports support. **Server default** uses the server’s own behavior. The choice applies to subsequent messages with that model.
 - While waiting for a model response, Chat shows a spinner and the current phase: **Thinking…**, **Reviewing tool results…**, or **Writing a partial answer…**. When a model includes a leading `<think>` block in its reply, expand **Model thinking** to see it.
 - Chat shows token usage for the last model request. With llama.cpp, the bar shows input and output tokens against the server's configured context size. With an OpenAI-compatible server that reports a context limit, the bar shows input tokens against that limit. You can also set **Context limit (input tokens)** in Settings for Ollama or OpenAI-compatible servers.
 - Pluto sends the full transcript of the open chat and the computer’s local date, time, and time zone to the configured model. New messages show a timestamp below the sender name.
-- Reopen conversations under **Recent chats**. Pluto opens the most recently updated chat on launch. Use **Archive chat** to move a conversation out of the recent list, and **Restore chat** to continue it.
+- Pluto opens the most recently updated active chat on launch. Use **Archive chat** to move it out of **Recent chats** and **Restore chat** to continue it. Use **Copy chat ID** to find its diagnostic events.
 
 ## Use skills and tools
 
@@ -154,7 +152,7 @@ In **Settings → MCP servers**, select a transport:
 - **Local process (stdio)**. Enter the installed command and one argument per line.
 - **Remote HTTP (Streamable HTTP)**. Enter the MCP endpoint and the bearer token variable name if the server requires it.
 
-Click **Test connection** to see which tools the server exposes. Click **Add MCP server**, then **Save settings**. To recheck an existing server, click **Test** next to it.
+Click **Test connection** to see which tools the server exposes. Click **Add MCP server**, then **Save settings**. To recheck an existing server, click **Test** next to it. Standalone tests run on your Mac. VM tests run inside the connected VM.
 
 Small catalogs are available directly. For larger catalogs, Pluto lets the model use `find_tools` to load the best match as needed. The search can target a specific server.
 
@@ -174,9 +172,7 @@ Quit and reopen Pluto Desktop. For a remote MCP server, enter `MCP_TOKEN` in **B
 
 ### Approvals and live activity
 
-In VM mode, Pluto Desktop offers **Run once** and **Decline**. The settings below are for standalone Desktop.
-
-By default, Pluto asks before running a terminal command or calling an MCP tool. Chat shows the tool name, action, elapsed time, and approval status below your latest message.
+In both modes, Pluto asks before running a terminal command or calling an MCP tool. Chat shows the tool name, action, elapsed time, and approval status below your latest message.
 
 | Approval | What it allows |
 | --- | --- |
@@ -185,7 +181,7 @@ By default, Pluto asks before running a terminal command or calling an MCP tool.
 | **Run always** for MCP | Approves future calls to that tool on the same server configuration, including calls with different arguments. |
 | **Auto-approve tool calls (at your own risk)** | Allows terminal and MCP calls without prompting. It is off by default and takes effect for new messages after **Save settings**. |
 
-Manage these options under **Settings → Tool approvals**. Use **Saved approvals** to forget individual rules. Automatic approvals appear as **Auto-approved** in Chat and in the debug log.
+Manage these options under **Settings → Tool approvals**. Use **Saved approvals** to forget individual rules for the current connection. Automatic approvals appear as **Auto-approved** in Chat and in the debug log.
 
 ## Local files and troubleshooting
 

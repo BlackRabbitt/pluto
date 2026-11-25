@@ -151,7 +151,7 @@ pub struct ApprovalRequest {
     pub rule: Option<ApprovalRule>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub enum ApprovalRule {
     Terminal(TerminalApproval),
     Mcp(McpApproval),
@@ -491,6 +491,21 @@ impl Config {
         Self::write_settings(path, &toml::to_string_pretty(&table)?)
     }
 
+    pub fn update_saved_approvals(path: &Path, edit: impl FnOnce(&mut Self)) -> Result<()> {
+        let mut table = Self::read_settings(path)?;
+        let mut config: Self = table.clone().try_into()?;
+        edit(&mut config);
+        table.insert(
+            "terminal_approvals".into(),
+            toml::Value::try_from(&config.terminal_approvals)?,
+        );
+        table.insert(
+            "mcp_approvals".into(),
+            toml::Value::try_from(&config.mcp_approvals)?,
+        );
+        Self::write_settings(path, &toml::to_string_pretty(&table)?)
+    }
+
     fn save_to(&self, path: &Path) -> Result<()> {
         Self::write_settings(path, &toml::to_string_pretty(self)?)
     }
@@ -613,7 +628,15 @@ impl Mcp {
     }
 
     pub async fn test_connection(&self) -> Result<Vec<String>> {
-        let (_client, tools) = self.discover(None).await?;
+        self.test_connection_at(None).await
+    }
+
+    pub async fn test_vm_connection(&self, workspace: &Path) -> Result<Vec<String>> {
+        self.test_connection_at(Some(workspace)).await
+    }
+
+    async fn test_connection_at(&self, workspace: Option<&Path>) -> Result<Vec<String>> {
+        let (_client, tools) = self.discover(workspace).await?;
         Ok(tools
             .into_iter()
             .map(|tool| tool.name.into_owned())
@@ -690,7 +713,7 @@ struct RemoteTool {
     definition: Value,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ToolActivity {
     pub name: String,
     pub action: Option<String>,
@@ -706,7 +729,7 @@ impl std::fmt::Display for ToolActivity {
     }
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub struct McpToolId {
     pub server: String,
     pub name: String,

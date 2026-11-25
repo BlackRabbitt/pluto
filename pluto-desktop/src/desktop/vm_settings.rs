@@ -1,13 +1,15 @@
 use super::{
     Lookup, egui, field,
+    mcp_settings::{McpAction, McpEditor},
     model_settings::{FallbackCheck, ModelCatalog, fallback_form},
+    saved_approval_list,
     settings_tabs::SettingsPage,
-    vm_client::query_settings,
+    vm_client::query_vm_api,
 };
 use anyhow::{Context, Result, bail, ensure};
 use pluto::{
     api::{Request, Response},
-    tools::{Mcp, ModelMode, Skill, VmSettings, valid_name},
+    tools::{ApprovalRule, Mcp, ModelMode, Skill, VmSettings},
 };
 use std::{fs::File, io::Read, path::PathBuf};
 use tokio::runtime::Runtime;
@@ -20,10 +22,7 @@ pub(super) struct VmSettingsForm {
     fallback_check: Option<FallbackCheck>,
     skill_path: String,
     import_from_mac: bool,
-    server_name: String,
-    server_http: bool,
-    server_address: String,
-    server_details: String,
+    mcp: McpEditor,
 }
 
 impl VmSettingsForm {
@@ -36,10 +35,7 @@ impl VmSettingsForm {
             fallback_check: None,
             skill_path: String::new(),
             import_from_mac: false,
-            server_name: String::new(),
-            server_http: false,
-            server_address: String::new(),
-            server_details: String::new(),
+            mcp: McpEditor::default(),
         }
     }
 
@@ -47,6 +43,10 @@ impl VmSettingsForm {
         let page = self.page;
         *self = Self::new(settings);
         self.page = page;
+    }
+
+    pub(super) fn tool_counts(&self) -> (usize, usize) {
+        (self.saved.skills.len(), self.saved.mcp.len())
     }
 
     pub(super) fn add_skill(&mut self, name: String, skill: Skill) {
@@ -59,6 +59,8 @@ impl VmSettingsForm {
         ui: &mut egui::Ui,
         runtime: &Runtime,
         instance: &str,
+        approvals: &mut Lookup<Vec<ApprovalRule>>,
+        supports_saved_approvals: bool,
     ) -> Result<Option<Request>> {
         let mut request = None;
         ui.horizontal_wrapped(|ui| {
@@ -90,13 +92,43 @@ impl VmSettingsForm {
                     request = Some(skill);
                 }
             }
-            SettingsPage::Mcp => self.mcp_ui(ui),
+            SettingsPage::Mcp => self.mcp_ui(ui, runtime, instance),
             SettingsPage::Approvals => {
                 ui.checkbox(
                     &mut self.draft.auto_approve_tools,
-                    "Auto-approve tool calls in this VM",
-                );
-                ui.weak("When enabled, terminal and MCP calls can run without asking.");
+                    "Auto-approve tool calls (at your own risk)",
+                ).on_hover_text("After saving, new messages can run terminal commands and MCP tools without asking.");
+                if supports_saved_approvals {
+                    if matches!(approvals, Lookup::Idle) {
+                        let instance = instance.to_owned();
+                        approvals.start(runtime, ui.ctx(), async move {
+                            match query_vm_api(instance, Request::SavedApprovals).await? {
+                                Response::SavedApprovals { rules } => Ok(rules),
+                                _ => bail!("Unexpected saved approvals response"),
+                            }
+                        });
+                    }
+                    match approvals {
+                        Lookup::Complete(Ok(rules)) => {
+                            if let Some(rule) = saved_approval_list(ui, rules.iter()) {
+                                request = Some(Request::ForgetApproval { rule });
+                            }
+                        }
+                        Lookup::Complete(Err(error)) => {
+                            let retry = ui
+                                .small_button("Retry loading saved approvals")
+                                .on_hover_text(format!("{error:#}"))
+                                .clicked();
+                            if retry {
+                                *approvals = Lookup::Idle;
+                            }
+                        }
+                        Lookup::Loading(_) => {
+                            ui.weak("Loading saved approvals…");
+                        }
+                        Lookup::Idle => {}
+                    }
+                }
             }
         }
         Ok(request)
@@ -122,7 +154,7 @@ impl VmSettingsForm {
                     };
                     let catalog_instance = instance.to_owned();
                     self.catalog.show(ui, runtime, mode, profile, "Optional · set inside the VM", |_, profile| async move {
-                        match query_settings(catalog_instance, Request::ListModels { mode, profile }).await? {
+                        match query_vm_api(catalog_instance, Request::ListModels { mode, profile }).await? {
                             Response::Models { names } => Ok(names),
                             _ => bail!("The VM did not return a model catalog"),
                         }
@@ -135,7 +167,7 @@ impl VmSettingsForm {
                                 let instance = instance.to_owned();
                                 let model = model.clone();
                                 result.start(runtime, ui.ctx(), async move {
-                                    match query_settings(instance, Request::CheckFallbackModel { model }).await? {
+                                    match query_vm_api(instance, Request::CheckFallbackModel { model }).await? {
                                         Response::FallbackModelMetadata { metadata } => Ok(metadata),
                                         _ => bail!("The VM did not return model metadata"),
                                     }
@@ -146,6 +178,8 @@ impl VmSettingsForm {
                     }
                 });
         }
+        ui.label("Terminal working directory");
+        ui.weak("/var/lib/pluto-workspace");
     }
 
     fn skills_ui(&mut self, ui: &mut egui::Ui) -> Result<Option<Request>> {
@@ -204,102 +238,39 @@ impl VmSettingsForm {
         Ok(None)
     }
 
-    fn mcp_ui(&mut self, ui: &mut egui::Ui) {
-        let mut remove = None;
-        for (name, server) in &self.draft.mcp {
-            ui.push_id(name, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(name);
-                    if ui.small_button("Edit").clicked() {
-                        self.server_name = name.clone();
-                        match server {
-                            Mcp::Stdio { command, args } => {
-                                self.server_http = false;
-                                self.server_address = command.clone();
-                                self.server_details = args.join("\n");
-                            }
-                            Mcp::Http { url, token_env } => {
-                                self.server_http = true;
-                                self.server_address = url.clone();
-                                self.server_details = token_env.clone();
-                            }
-                        }
-                    }
-                    if ui.small_button("Remove").clicked() {
-                        remove = Some(name.clone());
-                    }
-                });
+    fn mcp_ui(&mut self, ui: &mut egui::Ui, runtime: &Runtime, instance: &str) {
+        match self.mcp.show(ui, &self.draft.mcp, true) {
+            Some(McpAction::Test(name, server)) => {
+                self.start_mcp_test(ui, runtime, instance, name, server)
+            }
+            Some(McpAction::Remove(name)) => {
+                self.draft.mcp.remove(&name);
+            }
+            Some(McpAction::Save(name, server)) => {
+                self.mcp.applied(&name, &server);
+                self.draft.mcp.insert(name, server);
+            }
+            None => {}
+        }
+    }
+
+    fn start_mcp_test(
+        &mut self,
+        ui: &egui::Ui,
+        runtime: &Runtime,
+        instance: &str,
+        name: Option<String>,
+        server: Mcp,
+    ) {
+        let instance = instance.to_owned();
+        let target = server.clone();
+        self.mcp
+            .start_test(runtime, ui.ctx(), name, server, async move {
+                match query_vm_api(instance, Request::TestMcp { server: target }).await? {
+                    Response::McpTools { names } => Ok(names),
+                    _ => bail!("The VM did not return an MCP tool list"),
+                }
             });
-        }
-        if let Some(name) = remove {
-            self.draft.mcp.remove(&name);
-        }
-        if ui
-            .horizontal_wrapped(|ui| {
-                ui.radio_value(&mut self.server_http, false, "Local process (stdio)")
-                    .changed()
-                    | ui.radio_value(&mut self.server_http, true, "Remote HTTP")
-                        .changed()
-            })
-            .inner
-        {
-            self.server_address.clear();
-            self.server_details.clear();
-        }
-        field(ui, "Server name", &mut self.server_name, "example");
-        if self.server_http {
-            field(
-                ui,
-                "MCP endpoint",
-                &mut self.server_address,
-                "https://example.com/mcp",
-            );
-            field(
-                ui,
-                "Bearer token environment variable",
-                &mut self.server_details,
-                "Optional · set inside the VM",
-            );
-        } else {
-            field(
-                ui,
-                "Command in VM",
-                &mut self.server_address,
-                "/usr/local/bin/example",
-            );
-            ui.label("Arguments (one per line)");
-            ui.text_edit_multiline(&mut self.server_details);
-        }
-        let name = self.server_name.trim();
-        let address = self.server_address.trim();
-        let existing = self.draft.mcp.contains_key(name);
-        if ui
-            .add_enabled(
-                valid_name(name) && !address.is_empty(),
-                egui::Button::new(if existing {
-                    "Update MCP server"
-                } else {
-                    "Add MCP server"
-                }),
-            )
-            .clicked()
-        {
-            let server = if self.server_http {
-                Mcp::Http {
-                    url: address.into(),
-                    token_env: self.server_details.trim().into(),
-                }
-            } else {
-                Mcp::Stdio {
-                    command: address.into(),
-                    args: self.server_details.lines().map(str::to_owned).collect(),
-                }
-            };
-            self.draft.mcp.insert(name.to_owned(), server);
-            self.server_name.clear();
-            self.server_address.clear();
-            self.server_details.clear();
-        }
     }
 }
 
@@ -323,4 +294,48 @@ fn read_local_skill(path: &str) -> Result<String> {
         "Import supports SKILL.md files up to 32 KiB. Use a VM path for larger skills."
     );
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pluto::tools::Config;
+
+    #[test]
+    fn vm_mcp_settings_show_draft_and_saved_tests_with_tool_names() -> Result<()> {
+        let context = egui::Context::default();
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let server = Mcp::Http {
+            url: "http://127.0.0.1:54321/mcp".into(),
+            token_env: String::new(),
+        };
+        let mut form = VmSettingsForm::new(Config::default().into());
+        form.page = SettingsPage::Mcp;
+        form.draft.mcp.insert("fixture".into(), server.clone());
+        form.mcp.test = Some(super::super::mcp_settings::McpConnectionTest {
+            name: Some("fixture".into()),
+            server,
+            result: Lookup::Complete(Ok(vec!["lookup".into()])),
+        });
+        let output = context.run(Default::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                form.show(ui, &runtime, "pluto-test", &mut Lookup::Idle, false)
+                    .unwrap();
+            });
+        });
+        for label in [
+            "Test",
+            "Test connection",
+            "Connected · 1 tool found",
+            "lookup",
+        ] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(
+                    &shape.shape, egui::Shape::Text(text) if text.galley.text() == label
+                )),
+                "Missing {label}"
+            );
+        }
+        Ok(())
+    }
 }
