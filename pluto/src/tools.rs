@@ -569,7 +569,7 @@ impl Config {
             "SKILL.md needs a closing front matter delimiter and instructions"
         );
         let header: SkillHeader =
-            serde_yaml::from_str(&front_matter).context("SKILL.md needs name and description")?;
+            yaml_serde::from_str(&front_matter).context("SKILL.md needs name and description")?;
         ensure!(
             valid_name(&header.name) && !header.description.trim().is_empty(),
             "Use a letter, number, hyphen or underscore for the skill name and provide a description"
@@ -1192,6 +1192,28 @@ async fn run_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_header_accepts_yaml_aliases_and_folded_descriptions() -> Result<()> {
+        let header = Config::skill_header(
+            r#"---
+name: sample-skill
+metadata:
+  summary: &summary >-
+    Format a report:
+    preserve the source details.
+description: *summary
+---
+Skill instructions.
+"#,
+        )?;
+        assert_eq!(header.name, "sample-skill");
+        assert_eq!(
+            header.description,
+            "Format a report: preserve the source details."
+        );
+        Ok(())
+    }
 
     #[test]
     fn vm_settings_preserve_other_fields_and_reject_stale_edits() -> Result<()> {

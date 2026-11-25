@@ -1,13 +1,16 @@
 # Development guide
 
+[Home](README.md) · [Installation](docs/installation.md) · [Sandbox architecture](research/SANDBOXING.md)
+
 ## Start a task
 
-1. Start with the file or symbol named in the request. Otherwise, pick a row in the [code map](#code-map).
-2. Run `git status --short` and `git diff --stat`. Read the existing diff for the files you’ll touch.
-3. Find the entry point with `rg -n` and read the relevant lines. Follow callers and dependencies as needed to understand the behavior.
-4. Run the focused check for the normal entry point. For code changes, run both projects’ test suites.
+1. Start with the file or symbol named in the request. Otherwise, choose a task in the [code map](#code-map).
+2. Run `git status --short` and `git diff --stat`, then read the existing diff for the files you’ll touch.
+3. Find the entry point with `rg -n` and read a focused, line-numbered range. Follow the caller and any dependencies needed to understand the outcome.
+4. Before editing shared behavior, check the [behavior boundaries](#boundaries-to-check-when-changing-behavior).
+5. Run the focused check from the code map. For code changes, run both projects’ test suites under [Verify a change](#verify-a-change).
 
-Use the [README](README.md) for setup and user-facing behavior. For dependencies, start with the relevant manifest or `cargo tree -i <crate>`. Read targeted ranges in the lockfiles, `desktop.rs`, and `tools.rs`. Leave local settings, chats, logs, and build output outside routine source inspection.
+For dependencies, start with the relevant manifest or `cargo tree -i <crate>`. Read targeted ranges in the lockfiles, `desktop.rs`, and `tools.rs`. Leave local settings, chats, logs, and build output outside routine source inspection.
 
 ## Package boundaries
 
@@ -23,6 +26,8 @@ Standalone Desktop runs the Pluto library in-process. In VM mode, Desktop uses t
 To pin Rust for this checkout, run `rustup toolchain install 1.100.0` and `rustup override set 1.100.0` from the repository root. Remove the override with `rustup override unset`.
 
 ## Code map
+
+[Desktop UI](#desktop-ui) · [Harness, models, and tools](#harness-models-and-tools) · [Pluto VM](#pluto-vm) · [Documentation](#documentation)
 
 ### Desktop UI
 
@@ -58,6 +63,14 @@ To pin Rust for this checkout, run `rustup toolchain install 1.100.0` and `rustu
 | Edit per-VM settings in Desktop | [VM Settings form](pluto-desktop/src/desktop/vm_settings.rs), [configuration](pluto/src/tools.rs) · `VmSettings`, `Config::save_vm_settings` | [VM smoke test](pluto/vm/README.md#verify) |
 | Start, stop, restart, or view VM resource usage from Desktop | [Desktop VM client](pluto-desktop/src/desktop/vm_client.rs) · `VmPower`, `runtime_ui`, `VmUsage` | `vm_runtime` and `vm_usage` |
 
+### Documentation
+
+| Task | Read first | Focused check |
+| --- | --- | --- |
+| Install, update, run, or configure Desktop | [Installation](docs/installation.md) or the relevant guide in the [README](README.md#find-a-guide) | Match setup steps to the installer, manifest, or settings UI. Check changed links and anchors. |
+| Set up, operate, or integrate with Pluto VM | [VM guide](pluto/vm/README.md) | Match commands to the VM CLI and API fields to the shared types. |
+| Explain the sandbox design or cite benchmark results | [Sandboxing research](research/SANDBOXING.md) | Check implementation claims against linked source. Check benchmark scope in the [measurement data](research/sandbox-measurements.csv). |
+
 ## Boundaries to check when changing behavior
 
 - **Chat turns.** Both modes share the composer, transcript, history list, and approval controls. `Desktop::send` snapshots standalone settings and history. The VM service loads them in `Service::session`. Both use `agent::chat` and `ChatStore`.
@@ -70,7 +83,7 @@ To pin Rust for this checkout, run `rustup toolchain install 1.100.0` and `rustu
 
 ## Verify a change
 
-Run the tests named in the code map with the corresponding project manifest. Then use the following commands for the full checks.
+Pass the test name from the code map as a filter to `cargo test` with the corresponding project manifest. For code changes, use the following commands for the full checks.
 
 ```sh
 cargo fmt --manifest-path pluto/Cargo.toml --check

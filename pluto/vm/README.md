@@ -2,11 +2,11 @@
 
 Pluto VM is the optional Alpine Linux sandbox for Pluto, the assistant. Its virtual disk keeps your workspace and conversation between restarts. Connect with Pluto Desktop, the Mac app, or use the API from Terminal.
 
-[Use Pluto from Terminal](#use-pluto-without-desktop) · [Update Pluto in your existing VM](#update-pluto-vm)
+[Use Pluto from Terminal](#use-pluto-without-desktop) · [Set environment variables](#environment-variables-in-pluto-vm) · [Update Pluto in your existing VM](#update-pluto-vm)
 
 ## Quick start
 
-You’ll need an Apple Silicon Mac and Lima 2.3 or later. This example uses `llama-server` and a tool-capable GGUF model on the Mac. Running Pluto Desktop from source also requires Rust 1.100.0. [Lima installation](https://lima-vm.io/docs/installation/) · [Tested llama.cpp setup](../../README.md#tested-local-setup)
+You’ll need an Apple Silicon Mac and Lima 2.3 or later. This example uses `llama-server` and a tool-capable GGUF model on the Mac. Running Pluto Desktop from source also requires Rust 1.100.0. [Lima installation](https://lima-vm.io/docs/installation/) · [Tested llama.cpp setup](../../docs/models.md#tested-local-setup)
 
 ### 1. Install Pluto VM
 
@@ -16,7 +16,7 @@ From the repository root on your Mac, run:
 pluto/vm/vm install
 ```
 
-This builds Pluto from the current checkout in a separate Lima builder and installs it in the runtime VM, named `pluto` by default. Rerunning it updates the existing Pluto service. For more control over the build, see [Build manually from source](#build-manually-from-source).
+This builds Pluto from the current checkout in a separate Lima builder and installs it in the runtime VM, named `pluto` by default. Rerunning it updates the existing Pluto service. To keep the Linux binary, [build and install in separate steps](#build-manually-from-source).
 
 You can also open **Settings → Connection → New VM** in Pluto Desktop on Apple Silicon. Enter a name and click **Create VM**. Keep Desktop open while it builds and provisions the VM. When the VM appears in the connection list, click **Connect** and configure its model. Lima must already be installed.
 
@@ -140,7 +140,7 @@ In **Settings → VM runtime**, check the instance status, allocated vCPUs, and 
 ## Other model options
 
 - **Ollama on the Mac.** Use `provider = "ollama"`, `url = "http://127.0.0.1:11434"`, and the exact name of a downloaded model, such as `qwen3:4b`. Run `pluto/vm/vm forward-model 11434`. [Ollama model page](https://ollama.com/library/qwen3:4b)
-- **Hosted model.** Set `mode = "open_ai_compatible"` and configure `[models.openai]` with the API URL, model name, and `token_env` if needed. Put credential exports in the root-owned `/etc/conf.d/pluto` inside the VM with mode `0600`. As root in the VM, run `rc-service pluto restart`.
+- **Hosted model.** Set `mode = "open_ai_compatible"` and configure `[models.openai]` with the API URL, model name, and `token_env` if needed. [Set the variable in the VM service](#hosted-models-and-remote-mcp).
 
 ### Configure from Terminal
 
@@ -175,6 +175,66 @@ args = ["/var/lib/pluto-workspace/pluto-demo-mcp.py", "stdio"]
 ```
 
 Save the TOML file, then rerun `pluto/vm/vm configure "$pluto_model_config"` if you used the example file above. Changes take effect on the next turn.
+
+## Environment variables in Pluto VM
+
+### Open a shell in the VM
+
+From the repository root on your Mac, replace `plutoVM` with the instance name shown under **Settings → Connection**. The default name is `pluto`. Lima opens the shell over SSH.
+
+```sh
+export PLUTO_INSTANCE=plutoVM
+export LIMA_HOME="${PLUTO_LIMA_HOME:-$HOME/.pluto-lima}"
+pluto/vm/vm start &&
+  limactl shell --workdir=/ "$PLUTO_INSTANCE"
+```
+
+For commands you run yourself, export variables in this shell. To load them in future login shells, add the exports to your guest user's `~/.profile`.
+
+### Hosted models and remote MCP
+
+Inside the VM, open a root shell with `sudo -n sh`. Use the editor to add or update exports in the Pluto service configuration.
+
+```sh
+umask 077
+touch /etc/conf.d/pluto
+chown root:root /etc/conf.d/pluto
+chmod 600 /etc/conf.d/pluto
+vi /etc/conf.d/pluto
+```
+
+In the editor, add an export such as `export MODEL_API_KEY='your-key-here'`. Save it, finish any active Pluto turn, then run `rc-service pluto restart` in the root shell. Type `exit` to return to the guest user.
+
+In the model profile, set **Token environment variable** to `MODEL_API_KEY` (the `token_env` field in TOML). In a remote HTTP MCP profile, set **Bearer token environment variable** to the name you exported for that server. Several profiles in the same VM can reference the same variable.
+
+### Local MCP and terminal tools
+
+Pluto starts local MCP servers and terminal commands with a clean environment under the `pluto-tool` account. A CLI installed inside the VM can use its own credential configuration. For a CLI that requires environment variables, use a launcher that loads the exports for that CLI.
+
+In the guest, open a root shell with `sudo -n sh` and create a file for the exports.
+
+```sh
+umask 077
+touch /etc/example-tool.env
+chown root:pluto-tool /etc/example-tool.env
+chmod 640 /etc/example-tool.env
+vi /etc/example-tool.env
+```
+
+In the editor, add an export such as `export TOOL_API_KEY='your-key-here'`, using the variable name your CLI expects. Save it, then create the launcher. Replace `/usr/bin/example-tool` with the actual executable path in the VM.
+
+```sh
+cat > /usr/local/bin/example-tool-with-env <<'EOF'
+#!/bin/sh
+set -e
+. /etc/example-tool.env
+exec /usr/bin/example-tool "$@"
+EOF
+chmod 755 /usr/local/bin/example-tool-with-env
+exit
+```
+
+For local MCP, use `/usr/local/bin/example-tool-with-env` as the profile's **Launch command**, keep the usual arguments, and select **Test connection**. For terminal tools, ask Pluto to run that launcher with the arguments you need. Updates take effect the next time the launcher runs and persist across VM restarts. Any process running as `pluto-tool` can read the exports file.
 
 ## Try the notes skill and MCP fixture
 
@@ -229,49 +289,14 @@ To install the version in your current checkout or source archive, run `pluto/vm
 
 ## Build manually from source
 
-Run these commands from the repository root on your Mac. `pluto-builder` holds the build tools. Pluto VM runs the assistant and stores your workspace. Its default Lima instance is named `pluto`.
-
-**Set up the build VM once.** This gives the compiler 3 GiB of RAM and an 8 GiB disk. [Lima start options](https://lima-vm.io/docs/reference/limactl_start/) · [Rustup](https://rustup.rs/)
+Run these commands from the repository root on an Apple Silicon Mac with Lima installed. The build command uses the Lima builder, named `pluto-builder` by default, and writes an Alpine ARM64 executable to the path you give it.
 
 ```sh
-export LIMA_HOME="${PLUTO_LIMA_HOME:-$HOME/.pluto-lima}"
-limactl start --tty=false --name=pluto-builder --memory=3 --disk=8 pluto/vm/lima.yaml
-limactl shell --tty=false --workdir=/ pluto-builder sh -ec '
-  sudo -n apk add --no-cache build-base curl ca-certificates
-  curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/pluto-rustup.sh
-  sh /tmp/pluto-rustup.sh -y --profile minimal --default-toolchain 1.100.0
-'
+pluto/vm/vm build target/vm/pluto &&
+  pluto/vm/vm setup target/vm/pluto
 ```
 
-### Build the Linux executable
-
-This copies Pluto’s manifest, lockfile, and source into the running build VM and saves the Linux ARM64 executable at `target/vm/pluto` on your Mac.
-
-```sh
-mkdir -p target/vm
-COPYFILE_DISABLE=1 tar -C pluto -cf - Cargo.toml Cargo.lock src |
-  limactl shell --tty=false --workdir=/ pluto-builder sh -ec '
-    source_dir=$(mktemp -d /tmp/pluto-build.XXXXXX)
-    trap "rm -rf -- \"$source_dir\"" EXIT
-    cd "$source_dir"
-    tar -xf -
-    . "$HOME/.cargo/env"
-    build_dir="$HOME/.cache/pluto-build"
-    cargo +1.100.0 build --locked --release --target-dir "$build_dir"
-    strip "$build_dir/release/pluto"
-    cat "$build_dir/release/pluto"
-  ' > target/vm/pluto.tmp &&
-  mv target/vm/pluto.tmp target/vm/pluto
-```
-
-**Install the executable.** After the build succeeds, stop the builder and install the assistant in Pluto VM.
-
-```sh
-limactl stop pluto-builder
-pluto/vm/vm setup target/vm/pluto
-```
-
-Use the same Lima home and runtime instance name to install a rebuilt binary into an existing VM.
+Run only the build command if you just need the binary. To update an existing runtime VM with the setup command, use the same Lima home and instance name. Set `PLUTO_BUILDER` to choose the separate build VM.
 
 ## Run and move files
 

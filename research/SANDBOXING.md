@@ -1,6 +1,16 @@
-# How Pluto’s sandbox evolved
+# Pluto sandbox design and research
 
-The original question was how Pluto could run a command without giving it access to the Mac. The first design put individual commands in a disposable VM. **Pluto VM** now runs the assistant and its tools together, so the workspace and conversation survive a restart. **Pluto Desktop** is the Mac interface for both modes.
+[Home](../README.md) · [Development guide](../DEVELOPMENT.md) · [VM setup](../pluto/vm/README.md)
+
+Pluto VM runs the harness and tools inside a persistent Lima guest. Pluto Desktop connects over SSH to the service’s private Unix socket. Standalone mode runs the same harness on the host.
+
+| Topic | Where to read |
+| --- | --- |
+| Process and chat flow | [Chosen sandbox design](#chosen-sandbox-design) |
+| Design decisions and tradeoffs | [Harness placement](#1-why-the-harness-and-tools-run-together) · [Lima launcher](#3-why-lima-runs-the-build-and-runtime-vms) |
+| Files, credentials, approvals, and network | [VM boundary](#2-what-crosses-the-vm-boundary) |
+| Verified behavior and historical benchmarks | [Smoke test](#4-what-the-csv-smoke-test-verified) · [Measurement data (CSV)](sandbox-measurements.csv) |
+| Unimplemented designs | [Host integration proposals](#5-proposed-host-integrations) |
 
 ## Chosen sandbox design
 
@@ -32,6 +42,50 @@ flowchart TB
 | --- | --- | --- |
 | Standalone | In the Pluto Desktop process on your Mac | On the Mac with your account’s permissions |
 | Pluto VM | In the Pluto service inside a Linux VM | Inside the VM under a separate tool account |
+
+### How a chat turn runs
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Client as Desktop or Terminal
+    participant Pluto as Pluto harness
+    participant Model as Model server
+    participant Tool as Terminal tool
+
+    User->>Client: Send a prompt
+    alt Pluto VM
+        Client->>Pluto: Send chat request over SSH to the private VM socket
+        Note over Pluto,Tool: The service runs as pluto-api. Commands run as pluto-tool.
+    else Standalone Desktop
+        Client->>Pluto: Call the harness in-process
+        Note over Pluto,Tool: Commands run as the macOS user.
+    end
+    Pluto->>Pluto: Save user message
+    Pluto->>Model: Send system prompt, chat history, and available tools
+    loop While the model requests terminal calls
+        Model-->>Pluto: Request an executable and arguments
+        opt No saved rule or global auto-approval applies
+            Pluto-->>Client: Request approval
+            Client-->>User: Show the proposed command
+            User->>Client: Approve or decline
+            Client->>Pluto: Return the decision
+        end
+        alt Approved
+            Pluto->>Tool: Run command in the workspace
+            Tool-->>Pluto: Return exit code and output, or a tool error
+        else Declined
+            Pluto->>Pluto: Record the declined action as a tool result
+        end
+        Pluto->>Model: Send the conversation with the tool result
+    end
+    Model-->>Pluto: Return final reply
+    Pluto->>Pluto: Save assistant reply
+    Pluto-->>Client: Deliver the reply
+    Client-->>User: Show the reply
+```
+
+In Pluto VM, the workspace is `/var/lib/pluto-workspace`. The VM owner installs system packages such as Python through Lima. Pluto can then use those executables through the terminal tool. The tool accepts the executable and its arguments as separate fields. For example, `{"command":"python3","args":["--version"]}`. [VM transport and persistence](../pluto/src/vm.rs) · [Tool loop](../pluto/src/agent.rs) · [Terminal tool](../pluto/src/tools.rs) · [Use Pluto from Terminal](../pluto/vm/README.md#use-pluto-without-desktop)
 
 ## 1. Why the harness and tools run together
 
@@ -79,20 +133,11 @@ flowchart LR
     D --> E["5. Reopen chat and export report"]
 ```
 
-| Apple Silicon measurement | Result | Scope |
-| --- | ---: | --- |
-| Cold start to first Pluto API response, initial prototype | **About 21 s** | Boot from stopped. The API answered before any model inference. |
-| Cold restart to first Pluto API response, tool-launcher check | **22.10 s** | Individual run after updating the tool launcher. |
-| Cold restart to first Pluto API response, installer check | **19.09 s** | Individual run after adding one-command install and VM model settings. |
-| Cold restart to first Pluto API response, settings and catalog check | **22.04 s** | Individual run after testing separate chats, per-VM settings, and model discovery. |
-| Alpine VM download | **183 MiB** | Initial prototype download. Installed disk use and caches vary. |
-| Headless Pluto executable | **6.5 MiB** | Initial prototype Linux ARM64 binary. |
-| Pluto service peak resident memory | **4.9 MiB** | Short follow-up inside the VM. This measures the service process only. |
-| Original Pluto Desktop executable | **18.6 MiB** | Mac release binary before the package split. |
-| Original Pluto Desktop peak resident memory | **56 MiB** | A 10-second Mac launch with fresh settings and no model connected. |
-| Sparse runtime disk on the Mac | **246 MiB used** | One disposable VM with a 4 GiB virtual disk. Host usage varies with data written. |
+### Historical measurements
 
-**Runtime defaults** are **2 vCPUs, 512 MiB RAM, and a 4 GiB sparse disk**. The boot timings end at the first API response. Total host memory, disk growth over time, and time to the first reply with a live model remain open measurements. [Desktop benchmark](../README.md#desktop-benchmark) · [Runtime defaults](../pluto/vm/lima.yaml)
+The [measurement CSV](sandbox-measurements.csv) records one observation per row. Each row supplies a numeric value, unit, precision, and the conditions for that observation. The runs used Apple Silicon. VM timings measured the time to the first API response before model inference. The original Desktop baseline used a Rust 1.100.0 release build on macOS 26.7.3 before the package split.
+
+The runtime defaults are **2 vCPUs, 512 MiB RAM, and a 4 GiB sparse disk**. Total host memory, disk growth over time, and time to the first reply with a live model remain open measurements. [Runtime defaults](../pluto/vm/lima.yaml)
 
 ## 5. Proposed host integrations
 
