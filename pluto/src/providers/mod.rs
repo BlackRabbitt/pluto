@@ -36,7 +36,7 @@ pub struct ModelCapabilities {
     pub context_window: Option<u64>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
 pub struct FallbackMetadata {
     pub context_window: Option<u64>,
     pub supports_tools: Option<bool>,

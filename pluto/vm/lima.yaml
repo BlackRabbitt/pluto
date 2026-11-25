@@ -1,0 +1,19 @@
+minimumLimaVersion: 2.3.0
+base:
+  - template:_images/alpine-3.24
+arch: aarch64
+vmType: vz
+cpus: 2
+memory: 512MiB
+disk: 4GiB
+plain: true
+mounts: []
+containerd:
+  system: false
+  user: false
+propagateProxyEnv: false
+networkOpts:
+  hostLoopback: false
+ssh:
+  loadDotSSHPubKeys: false
+  overVsock: false

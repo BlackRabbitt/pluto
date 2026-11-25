@@ -25,14 +25,14 @@ impl fmt::Display for CatalogRateLimit {
 
 impl std::error::Error for CatalogRateLimit {}
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct FallbackSettings {
     pub enabled: bool,
     pub models: Vec<FallbackModel>,
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct FallbackModel {
     pub url: String,

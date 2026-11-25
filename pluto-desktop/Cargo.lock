@@ -2117,8 +2117,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
- "eframe",
- "egui_commonmark",
  "iana-time-zone",
  "reqwest",
  "rmcp",
@@ -2127,6 +2125,21 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "pluto-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "eframe",
+ "egui_commonmark",
+ "pluto",
+ "reqwest",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -1,2 +1,5 @@
 /target/
+/pluto/target/
+/pluto-desktop/target/
 /tests/test-notes/.notes.sqlite3*
+/pluto/tests/test-notes/.notes.sqlite3*

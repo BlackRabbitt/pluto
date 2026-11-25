@@ -294,13 +294,14 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-if sys.argv[1] == "stdio":
-    for line in sys.stdin:
-        response = mcp(json.loads(line))
-        if response is not None:
-            print(json.dumps(response), flush=True)
-else:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.failed_model_request = None
-    print(server.server_port, flush=True)
-    server.serve_forever()
+if __name__ == "__main__":
+    if sys.argv[1] == "stdio":
+        for line in sys.stdin:
+            response = mcp(json.loads(line))
+            if response is not None:
+                print(json.dumps(response), flush=True)
+    else:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.failed_model_request = None
+        print(server.server_port, flush=True)
+        server.serve_forever()

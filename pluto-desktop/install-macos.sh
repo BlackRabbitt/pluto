@@ -16,7 +16,7 @@ if ! xcode-select -p >/dev/null 2>&1; then
     exit 1
 fi
 
-cd "$(dirname "$0")"
+CDPATH='' cd -- "$(dirname -- "$0")"
 rust_version=1.100.0
 if ! rustup run "$rust_version" rustc --version >/dev/null 2>&1; then
     rustup toolchain install "$rust_version"
@@ -61,7 +61,15 @@ staged_launcher="$staging/Pluto.app"
 contents="$staged_launcher/Contents"
 iconset="$staging/Pluto.iconset"
 mkdir -p "$contents/MacOS" "$contents/Resources" "$iconset"
-cp "$HOME/.cargo/bin/pluto" "$contents/MacOS/Pluto"
+cp "$HOME/.cargo/bin/pluto-desktop" "$contents/MacOS/Pluto"
+
+if [ "$(uname -m)" = arm64 ]; then
+    vm_resources="$contents/Resources/pluto"
+    mkdir -p "$vm_resources/vm"
+    cp ../pluto/Cargo.toml ../pluto/Cargo.lock "$vm_resources/"
+    cp -R ../pluto/src "$vm_resources/"
+    cp ../pluto/vm/vm ../pluto/vm/lima.yaml ../pluto/vm/pluto.init ../pluto/vm/setup-vm.sh "$vm_resources/vm/"
+fi
 
 for size in 16 32 128 256 512; do
     name="icon_${size}x${size}"
@@ -81,13 +89,15 @@ cat > "$contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>
     <string>Pluto</string>
     <key>CFBundleName</key>
-    <string>Pluto</string>
+    <string>Pluto Desktop</string>
+    <key>CFBundleDisplayName</key>
+    <string>Pluto Desktop</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
     <string>Pluto.icns</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Pluto connects to model and MCP servers you configure on your local network.</string>
+    <string>Pluto Desktop can connect to model and MCP servers you configure on your local network.</string>
 </dict>
 </plist>
 PLIST
@@ -100,4 +110,4 @@ mv -n "$staged_launcher" "$applications/"
 test ! -e "$staged_launcher"
 
 printf '\nLauncher: %s\n' "$launcher"
-printf '%s\n' 'Open Pluto from Spotlight or your Applications folder.'
+printf '%s\n' 'Open Pluto Desktop from Spotlight or your Applications folder.'
