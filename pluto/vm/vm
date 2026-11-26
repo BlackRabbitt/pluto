@@ -31,9 +31,9 @@ Usage: pluto/vm/vm install [--latest]
        pluto/vm/vm start | stop | status | api
        pluto/vm/vm configure TOOLS_TOML
        pluto/vm/vm import HOST_FILE WORKSPACE_NAME
-       pluto/vm/vm import --folder HOST_FOLDER WORKSPACE_NAME
+       pluto/vm/vm import --folder HOST_FOLDER WORKSPACE_PATH
        pluto/vm/vm export WORKSPACE_NAME > HOST_FILE
-       pluto/vm/vm export --folder WORKSPACE_NAME > HOST_ZIP
+       pluto/vm/vm export --folder WORKSPACE_PATH > HOST_ZIP
        pluto/vm/vm forward-model HOST_PORT [VM_PORT]
 USAGE
     exit 2
@@ -45,10 +45,66 @@ filename() {
     esac
 }
 
-folder_name() {
-    case "$1" in
-        ''|.|..|*/*) echo "Use a single workspace folder name" >&2; exit 2 ;;
+folder_path() {
+    workspace_path=${1#/var/lib/pluto-workspace/}
+    case "/$workspace_path/" in
+        //*|*/../*) echo "Use a folder path under /var/lib/pluto-workspace, without .." >&2; exit 2 ;;
     esac
+    if [ "$(basename -- "$workspace_path")" = . ]; then
+        echo "Specify a folder name at the end of the workspace path" >&2
+        exit 2
+    fi
+}
+
+transfer_folder() {
+    # shellcheck disable=SC2016
+    as_user pluto-tool sh -ec '
+        cd -P /var/lib/pluto-workspace
+        workspace=$PWD
+        if [ "$1" = import ]; then
+            staging=$(mktemp -d "$workspace/.import.XXXXXX")
+        else
+            staging=$(mktemp -d)
+        fi
+        trap '\''rm -rf -- "$staging"'\'' EXIT
+        if [ "$1" = import ]; then
+            cat > "$staging/folder.zip"
+            unzip -q "$staging/folder.zip" -d "$staging/content"
+        fi
+
+        parent=$(dirname -- "$2")
+        folder=./$(basename -- "$2")
+        while [ -n "$parent" ]; do
+            component=${parent%%/*}
+            parent=${parent#"$component"}
+            parent=${parent#/}
+            case "$component" in ""|.) continue ;; esac
+            if [ "$1" = import ] && [ ! -d "./$component" ]; then
+                mkdir -p -- "./$component"
+            fi
+            cd -P -- "./$component"
+            case "$PWD/" in
+                "$workspace/"*) ;;
+                *) echo "Folder path resolves outside the workspace" >&2; exit 1 ;;
+            esac
+        done
+
+        if [ "$1" = import ]; then
+            # Reserve the destination so concurrent imports cannot replace it.
+            mkdir -- "$folder"
+            if ! mv -fT -- "$staging/content/$3" "$folder"; then
+                rmdir -- "$folder"
+                exit 1
+            fi
+        else
+            if [ ! -d "$folder" ] || [ -L "$folder" ]; then
+                printf "Workspace folder not found: %s\n" "$2" >&2
+                exit 1
+            fi
+            zip -qry -MM "$staging/folder.zip" "$folder"
+            cat "$staging/folder.zip"
+        fi
+    ' sh "$@"
 }
 
 port() {
@@ -215,7 +271,7 @@ case "${1:-}" in
     import)
         if [ "$#" -eq 4 ] && [ "$2" = --folder ]; then
             [ -d "$3" ] || usage
-            folder_name "$4"
+            folder_path "$4"
             source_dir=$(CDPATH='' cd -- "$3/." && pwd -P)
             source_name=$(basename -- "$source_dir")
             staging=$(mktemp -d)
@@ -224,21 +280,7 @@ case "${1:-}" in
                 cd -- "$(dirname -- "$source_dir")"
                 zip -qry -MM "$staging/folder.zip" "./$source_name"
             )
-            # shellcheck disable=SC2016
-            as_user pluto-tool sh -ec '
-                cd /var/lib/pluto-workspace
-                staging=$(mktemp -d .import.XXXXXX)
-                trap '\''rm -rf -- "$staging"'\'' EXIT
-                cat > "$staging/folder.zip"
-                unzip -q "$staging/folder.zip" -d "$staging/content"
-                destination=./$1
-                # Reserve the destination so concurrent imports cannot replace it.
-                mkdir -- "$destination"
-                if ! mv -fT -- "$staging/content/$2" "$destination"; then
-                    rmdir -- "$destination"
-                    exit 1
-                fi
-            ' sh "$4" "$source_name" < "$staging/folder.zip" > /dev/null
+            transfer_folder import "$workspace_path" "$source_name" < "$staging/folder.zip" > /dev/null
             exit
         fi
         [ "$#" -eq 3 ] && [ -f "$2" ] || usage
@@ -255,24 +297,12 @@ case "${1:-}" in
         ;;
     export)
         if [ "$#" -eq 3 ] && [ "$2" = --folder ]; then
-            folder_name "$3"
+            folder_path "$3"
             if [ -t 1 ]; then
                 echo "Redirect folder export to a ZIP file, for example: > folder.zip" >&2
                 exit 2
             fi
-            # shellcheck disable=SC2016
-            as_user pluto-tool sh -ec '
-                cd /var/lib/pluto-workspace
-                folder=./$1
-                if [ ! -d "$folder" ] || [ -L "$folder" ]; then
-                    printf "Workspace folder not found: %s\n" "$1" >&2
-                    exit 1
-                fi
-                staging=$(mktemp -d)
-                trap '\''rm -rf -- "$staging"'\'' EXIT
-                zip -qry -MM "$staging/folder.zip" "$folder"
-                cat "$staging/folder.zip"
-            ' sh "$3"
+            transfer_folder export "$workspace_path"
             exit
         fi
         [ "$#" -eq 2 ] || usage

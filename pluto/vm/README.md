@@ -305,8 +305,8 @@ Run only the build command if you just need the binary. To update an existing ru
 | Start for file transfers or model forwarding | `pluto/vm/vm start` |
 | Import a file as `sales.csv` in the VM | `pluto/vm/vm import sales.csv sales.csv` |
 | Export a report Pluto wrote | `pluto/vm/vm export report.csv > report.csv` |
-| Upload a whole folder to the VM workspace | `pluto/vm/vm import --folder HOST_FOLDER WORKSPACE_NAME` |
-| Download a workspace folder as a ZIP | `pluto/vm/vm export --folder WORKSPACE_NAME > HOST_ZIP` |
+| Upload a whole folder to the VM workspace | `pluto/vm/vm import --folder HOST_FOLDER WORKSPACE_PATH` |
+| Download a workspace folder as a ZIP | `pluto/vm/vm export --folder WORKSPACE_PATH > HOST_ZIP` |
 | Stop the VM | `pluto/vm/vm stop` |
 
 See [Copy whole folders between Mac and VM](#copy-whole-folders-between-mac-and-vm) for setup and examples.
@@ -393,20 +393,20 @@ limactl shell --tty=false --workdir=/ "$PLUTO_INSTANCE" \
 
 ### Upload a folder from Mac to VM
 
-Pass a folder on your Mac and a name for it in the workspace. Quote paths and names that contain spaces. Pluto creates a temporary ZIP, uploads it, and unpacks it as `pluto-tool`.
+Pass a folder on your Mac and its destination in the VM. For both import and export, you can use a folder name, a path relative to `/var/lib/pluto-workspace/`, or the full path inside that workspace. Quote paths that contain spaces. Use paths without `..`.
 
 ```sh
-pluto/vm/vm import --folder "$HOME/Documents/My Project" "My Project"
+pluto/vm/vm import --folder "$HOME/Documents/My Project" "projects/My Project"
 ```
 
-The result is `/var/lib/pluto-workspace/My Project/`. The destination name must be a single folder name. If that name already exists, choose another one. Hidden files, empty subfolders, and symbolic links are included.
+The result is `/var/lib/pluto-workspace/projects/My Project/`. You can also pass that full path as the destination. Pluto uploads a temporary ZIP and unpacks it as `pluto-tool`. It creates missing parent folders and requires a new destination folder. Hidden files, empty subfolders, and symbolic links are included.
 
 ### Download a folder from VM to Mac
 
-Pass the name of a folder directly under `/var/lib/pluto-workspace/` and redirect the ZIP to a file on your Mac. The archive contains the top-level folder and its contents. Use a fresh ZIP filename to keep an earlier download because `>` overwrites the file at that path.
+Pass the folder’s workspace path and redirect the ZIP to a file on your Mac. The archive starts at the selected folder, so in this example it contains `My Project/` and its contents. Use a fresh ZIP filename to keep an earlier download because `>` overwrites the file at that path.
 
 ```sh
-pluto/vm/vm export --folder "My Project" > "$HOME/Downloads/my-project.zip"
+pluto/vm/vm export --folder "/var/lib/pluto-workspace/projects/My Project" > "$HOME/Downloads/my-project.zip"
 ```
 
 Use `unzip -l` to list the archive contents whenever you want to check the download. When you’re ready to unpack it, `unzip -n` keeps existing files at the destination.

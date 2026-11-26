@@ -177,15 +177,25 @@ name = "vm-fixture"
         (folder / "empty").mkdir(parents=True)
         (folder / ".hidden").write_bytes(b"folder transfer\n")
         (folder / "link").symlink_to(".hidden")
+        (folder / "outside").symlink_to("/tmp")
         workspace_name = f"Smoke's folder {directory.name}"
-        vm("import", "--folder", folder, workspace_name)
-        archive = directory / "download.zip"
-        with archive.open("wb") as output:
-            vm("export", "--folder", workspace_name, stdout=output)
-        with ZipFile(archive) as exported:
-            assert exported.read(f"{workspace_name}/.hidden") == b"folder transfer\n"
-            assert exported.getinfo(f"{workspace_name}/empty/").is_dir()
-            assert exported.read(f"{workspace_name}/link") == b".hidden"
+        relative = f"{workspace_name}/projects/Project One"
+        absolute = f"/var/lib/pluto-workspace/{workspace_name}/archive/Project Two"
+        for destination, export_path, name in (
+            (relative, f"/var/lib/pluto-workspace/{relative}/", "Project One"),
+            (absolute, f"{workspace_name}/archive/Project Two", "Project Two"),
+        ):
+            vm("import", "--folder", folder, destination)
+            archive = directory / f"{name}.zip"
+            with archive.open("wb") as output:
+                vm("export", "--folder", export_path, stdout=output)
+            with ZipFile(archive) as exported:
+                assert exported.read(f"{name}/.hidden") == b"folder transfer\n"
+                assert exported.getinfo(f"{name}/empty/").is_dir()
+                assert exported.read(f"{name}/link") == b".hidden"
+        for command in (("import", "--folder", folder), ("export", "--folder")):
+            escape = subprocess.run([VM, *command, f"{relative}/outside/escape"], capture_output=True)
+            assert escape.returncode != 0 and b"outside the workspace" in escape.stderr, escape.stderr
         vm("configure", config)
         previous = first_response({"type": "model_settings"})["models"]
         models = {**previous, "openai": {**previous["openai"], "name": "updated-vm-fixture"}}
