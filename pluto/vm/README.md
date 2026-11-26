@@ -376,6 +376,8 @@ Pluto VM uses 2 CPUs, 512 MiB RAM, and a sparse 4 GiB disk by default. It has ou
 
 ## Copy whole folders between Mac and VM
 
+In Pluto Desktop, connect to a VM and open **Files**. Open a workspace folder to browse its contents. **Import File** and **Import Folder** copy from your Mac into the open folder. Select a file or folder and choose **Export Selected** to save it on your Mac. Folder exports are ZIPs.
+
 Run these commands from the repository root on your Mac. Replace `plutoVM` with the instance name in **Settings → Connection**. The default instance name is `pluto`. Start the VM if it’s stopped.
 
 ```sh

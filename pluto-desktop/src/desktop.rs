@@ -4,6 +4,7 @@ mod model_settings;
 mod settings_tabs;
 #[cfg(unix)]
 mod vm_client;
+mod vm_files;
 #[cfg(unix)]
 mod vm_settings;
 

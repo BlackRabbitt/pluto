@@ -196,6 +196,17 @@ name = "vm-fixture"
         for command in (("import", "--folder", folder), ("export", "--folder")):
             escape = subprocess.run([VM, *command, f"{relative}/outside/escape"], capture_output=True)
             assert escape.returncode != 0 and b"outside the workspace" in escape.stderr, escape.stderr
+        items = vm("list-files", relative, capture_output=True).stdout.split(b"\0")
+        assert items.pop() == b""
+        assert set(zip(items[::2], items[1::2], strict=True)) == {
+            (b"d", b"empty"), (b"f", b".hidden"),
+        }
+        file_path = f"{relative}/Report with spaces.csv"
+        vm("import", "--path", csv, file_path)
+        assert vm("export", "--path", file_path, capture_output=True).stdout == csv.read_bytes()
+        duplicate = subprocess.run([VM, "import", "--path", mcp, file_path], capture_output=True)
+        assert duplicate.returncode != 0
+        assert vm("export", "--path", file_path, capture_output=True).stdout == csv.read_bytes()
         vm("configure", config)
         previous = first_response({"type": "model_settings"})["models"]
         models = {**previous, "openai": {**previous["openai"], "name": "updated-vm-fixture"}}

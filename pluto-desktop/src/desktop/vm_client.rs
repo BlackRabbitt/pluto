@@ -1,7 +1,7 @@
 use super::{
     ApprovalDecision, ApprovalRequest, ChatComposer, CommonMarkCache, Desktop, Lookup,
     PickerCatalog, chat_list, chat_title, chat_transcript, context_usage, egui, field,
-    thinking_picker, tool_approval_dialog, vm_settings::VmSettingsForm,
+    thinking_picker, tool_approval_dialog, vm_files::VmFiles, vm_settings::VmSettingsForm,
 };
 use anyhow::{Context, Result, bail, ensure};
 use pluto::{
@@ -283,7 +283,7 @@ fn lima_command() -> Result<Command> {
     Ok(command)
 }
 
-async fn create_vm(instance: String) -> Result<()> {
+pub(super) fn vm_helper_command(instance: &str) -> Result<Command> {
     let lima = lima_executable()?;
     let resources = "Contents/Resources/pluto";
     let executable = std::env::current_exe()?;
@@ -311,10 +311,18 @@ async fn create_vm(instance: String) -> Result<()> {
                 .flat_map(std::env::split_paths),
         ),
     )?;
-    let output = Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .arg(helper)
-        .args(["create", &instance])
+        .env("PLUTO_INSTANCE", instance)
         .env("PATH", path)
+        .kill_on_drop(true);
+    Ok(command)
+}
+
+async fn create_vm(instance: String) -> Result<()> {
+    let output = vm_helper_command(&instance)?
+        .args(["create", &instance])
         .output()
         .await
         .context("Could not start the Pluto VM installer")?;
@@ -565,13 +573,21 @@ pub(super) struct VmClient {
     decision: Option<Decision>,
     ready: bool,
     busy: bool,
-    settings: bool,
+    page: VmPage,
+    files: VmFiles,
     picker: VmPicker,
     settings_form: Option<VmSettingsForm>,
     settings_load_attempted: bool,
     settings_status: Option<String>,
     resources: Lookup<VmResources>,
     usage: VmUsageMonitor,
+}
+
+#[derive(PartialEq)]
+enum VmPage {
+    Chat,
+    Files,
+    Settings,
 }
 
 enum ClientEvent {
@@ -634,7 +650,8 @@ impl VmClient {
             decision: None,
             ready: false,
             busy: false,
-            settings: false,
+            page: VmPage::Chat,
+            files: VmFiles::default(),
             picker: VmPicker::default(),
             settings_form: None,
             settings_load_attempted: false,
@@ -705,7 +722,7 @@ impl VmClient {
     }
 
     fn new_chat(&mut self) {
-        self.settings = false;
+        self.page = VmPage::Chat;
         self.chat_id = None;
         self.history = ChatHistory::default();
         self.reset_chat();
@@ -746,7 +763,7 @@ impl VmClient {
             self.new_chat();
         }
         if self.archived.is_some()
-            && !self.settings
+            && self.page == VmPage::Chat
             && let Some(chat_id) = &self.chat_id
         {
             let archive = !self.archived_chat();
@@ -777,12 +794,12 @@ impl VmClient {
                 .unwrap_or_default()
                 .iter()
                 .map(|chat| (&chat.id, chat.title.as_str())),
-            self.chat_id.as_ref().filter(|_| !self.settings),
+            self.chat_id.as_ref().filter(|_| self.page == VmPage::Chat),
             enabled,
         )
         .cloned();
         if let Some(chat_id) = selected {
-            self.settings = false;
+            self.page = VmPage::Chat;
             if self.chat_id.as_ref() != Some(&chat_id) {
                 self.request(Request::OpenChat { chat_id }, ui.ctx());
             }
@@ -828,7 +845,7 @@ impl VmClient {
             return;
         }
         if matches!(&self.capabilities, Lookup::Complete(Ok(caps)) if caps.provider.is_none()) {
-            self.settings = true;
+            self.page = VmPage::Settings;
             self.settings_status =
                 Some("Choose a provider, enter its server URL, and select a model.".into());
             return;
@@ -1235,7 +1252,7 @@ impl eframe::App for VmClient {
                 ClientEvent::Response(_) => {}
                 ClientEvent::Decision(decision) => {
                     if decision.retry {
-                        self.settings = false;
+                        self.page = VmPage::Chat;
                         self.tool_progress = None;
                     }
                     self.decision = Some(decision);
@@ -1269,13 +1286,26 @@ impl eframe::App for VmClient {
             super::desktop_brand(ui, self.logo.as_ref());
             ui.weak(format!("Pluto VM · {}", self.instance));
             ui.add_space(20.0);
-            if ui.selectable_label(!self.settings, "Chat").clicked() {
-                self.settings = false;
+            if ui
+                .selectable_label(self.page == VmPage::Chat, "Chat")
+                .clicked()
+            {
+                self.page = VmPage::Chat;
             }
-            if ui.selectable_label(self.settings, "Settings").clicked() && !self.settings {
+            if ui
+                .selectable_label(self.page == VmPage::Files, "Files")
+                .clicked()
+            {
+                self.page = VmPage::Files;
+            }
+            if ui
+                .selectable_label(self.page == VmPage::Settings, "Settings")
+                .clicked()
+                && self.page != VmPage::Settings
+            {
                 self.picker.refresh();
                 self.resources = Lookup::Idle;
-                self.settings = true;
+                self.page = VmPage::Settings;
             }
             self.chat_navigation(ui);
             if let Some(form) = &self.settings_form {
@@ -1283,7 +1313,7 @@ impl eframe::App for VmClient {
                 super::tool_counts_ui(ui, skills, servers);
             }
         });
-        if self.settings {
+        if self.page == VmPage::Settings {
             if self.ready && !self.busy && !self.settings_load_attempted {
                 self.request(Request::VmSettings, context);
             }
@@ -1302,6 +1332,18 @@ impl eframe::App for VmClient {
             return;
         }
         self.usage = VmUsageMonitor::default();
+        if self.page == VmPage::Files {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::central_panel(&context.style())
+                        .inner_margin(egui::Margin::same(24)),
+                )
+                .show(context, |ui| {
+                    self.files.show(ui, &self.runtime, &self.instance)
+                });
+            self.approval(context);
+            return;
+        }
         if self.ready
             && !self.busy
             && self.archived.is_some()
