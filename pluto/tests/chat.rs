@@ -1,11 +1,13 @@
-use crate::agent::{self, ApprovalDecision, Event, TokenUsage, ToolPhase, TurnSelection};
-use crate::diagnostics::Trace;
-use crate::model_fallback::{FallbackModel, FallbackSettings, ModelCooldowns};
-use crate::providers::{Connection, Provider, ThinkingSetting};
-use crate::tools::{
+#![cfg(unix)]
+
+use anyhow::{Context, Result};
+use pluto::agent::{self, ApprovalDecision, Event, TokenUsage, ToolPhase, TurnSelection};
+use pluto::diagnostics::Trace;
+use pluto::model_fallback::{FallbackModel, FallbackSettings, ModelCooldowns};
+use pluto::providers::{Connection, Provider, ThinkingSetting};
+use pluto::tools::{
     ApprovalRule, Config, Mcp, McpToolId, ModelMode, ModelProfile, ModelSettings, ToolSet,
 };
-use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::time::Duration;
 use std::{fs, path::Path, process::Stdio};

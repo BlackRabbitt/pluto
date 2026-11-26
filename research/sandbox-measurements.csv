@@ -1,0 +1,11 @@
+component,metric,value,unit,precision,conditions
+Pluto VM,Cold start to first API response,21,s,approximate,Boot from stopped in the initial prototype
+Pluto VM,Cold restart to first API response,22.10,s,reported,Single run after updating the tool launcher
+Pluto VM,Cold restart to first API response,19.09,s,reported,Single run after adding one-command install and VM model settings
+Pluto VM,Cold restart to first API response,22.04,s,reported,"Single run after testing separate chats, per-VM settings, and model discovery"
+Alpine VM,Download size,183,MiB,reported,Initial prototype download. Installed disk use and caches vary.
+Headless Pluto,Executable size,6.5,MiB,reported,Initial prototype Linux ARM64 binary
+Pluto service,Peak resident memory,4.9,MiB,reported,Short follow-up inside the VM measuring the service process
+Pluto Desktop,Executable size,18.6,MiB,reported,Release binary before the package split
+Pluto Desktop,Peak resident memory,56,MiB,reported,10-second sandboxed launch before the package split with fresh settings and no model connected
+Pluto VM,Host disk usage,246,MiB,reported,One disposable VM with a 4 GiB sparse virtual disk. Host usage varies with data written.

@@ -38,6 +38,8 @@ pub struct Config {
     pub mcp_approvals: Vec<McpApproval>,
     pub skills: BTreeMap<String, Skill>,
     pub mcp: BTreeMap<String, Mcp>,
+    #[serde(skip)]
+    pub vm_tools: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -57,7 +59,7 @@ impl ModelMode {
     }
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ModelSettings {
     pub mode: ModelMode,
@@ -65,7 +67,7 @@ pub struct ModelSettings {
     pub openai: ModelProfile,
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ModelProfile {
     pub provider: Option<Provider>,
@@ -84,22 +86,49 @@ impl ModelSettings {
     }
 
     pub fn connection(&self, mode: ModelMode) -> Result<Connection> {
-        let profile = self.profile(mode);
+        self.profile(mode).connection(mode)
+    }
+}
+
+impl ModelProfile {
+    pub fn connection(&self, mode: ModelMode) -> Result<Connection> {
         let provider = match mode {
-            ModelMode::LocalOnly => match profile.provider {
+            ModelMode::LocalOnly => match self.provider {
                 Some(provider @ (Provider::LlamaCpp | Provider::Ollama)) => provider,
                 _ => anyhow::bail!("Choose llama.cpp or Ollama for the local model"),
             },
             ModelMode::OpenAiCompatible => Provider::OpenAiCompatible,
         };
-        Connection::new(provider, &profile.url, &profile.token_env)
+        Connection::new(provider, &self.url, &self.token_env)
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Skill {
     pub path: PathBuf,
     pub description: String,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VmSettings {
+    pub models: ModelSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_fallbacks: Option<crate::model_fallback::FallbackSettings>,
+    pub skills: BTreeMap<String, Skill>,
+    pub mcp: BTreeMap<String, Mcp>,
+    pub auto_approve_tools: bool,
+}
+
+impl From<Config> for VmSettings {
+    fn from(config: Config) -> Self {
+        Self {
+            models: config.models,
+            model_fallbacks: Some(config.model_fallbacks),
+            skills: config.skills,
+            mcp: config.mcp,
+            auto_approve_tools: config.auto_approve_tools,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,7 +151,7 @@ pub struct ApprovalRequest {
     pub rule: Option<ApprovalRule>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub enum ApprovalRule {
     Terminal(TerminalApproval),
     Mcp(McpApproval),
@@ -220,6 +249,7 @@ impl Default for Config {
             mcp_approvals: Vec::new(),
             skills: BTreeMap::new(),
             mcp: BTreeMap::new(),
+            vm_tools: false,
         }
     }
 }
@@ -313,53 +343,177 @@ impl Config {
         Self::load_from(&Self::path()?)
     }
 
-    fn load_from(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(text) => {
-                let mut table: toml::Table =
-                    toml::from_str(&text).with_context(|| format!("Invalid {}", path.display()))?;
-                if !table.contains_key("models") {
-                    let mut profile: ModelProfile = [
-                        ("model_provider", "provider"),
-                        ("model_url", "url"),
-                        ("model_name", "name"),
-                        ("model_token_env", "token_env"),
-                        ("model_context_limit", "context_limit"),
-                    ]
-                    .into_iter()
-                    .filter_map(|(old, new)| table.remove(old).map(|value| (new.into(), value)))
-                    .collect::<toml::Table>()
-                    .try_into()?;
-                    let mut models = ModelSettings::default();
-                    if profile.provider == Some(Provider::OpenAiCompatible)
-                        || (profile.provider.is_none() && !profile.url.trim().is_empty())
-                    {
-                        profile.provider = None;
-                        models.mode = ModelMode::OpenAiCompatible;
-                        models.openai = profile;
-                    } else {
-                        models.local = profile;
-                    }
-                    table.insert("models".into(), toml::Value::try_from(models)?);
-                }
-                table
-                    .try_into()
-                    .with_context(|| format!("Invalid {}", path.display()))
+    pub fn load_from(path: &Path) -> Result<Self> {
+        Self::read_settings(path)?
+            .try_into()
+            .with_context(|| format!("Invalid {}", path.display()))
+    }
+
+    fn read_settings(path: &Path) -> Result<toml::Table> {
+        let mut table = match fs::read_to_string(path) {
+            Ok(text) => toml::from_str::<toml::Table>(&text)
+                .with_context(|| format!("Invalid {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(toml::Table::new());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error).with_context(|| format!("Could not read {}", path.display())),
+            Err(error) => {
+                return Err(error).with_context(|| format!("Could not read {}", path.display()));
+            }
+        };
+        if !table.contains_key("models") {
+            let mut profile: ModelProfile = [
+                ("model_provider", "provider"),
+                ("model_url", "url"),
+                ("model_name", "name"),
+                ("model_token_env", "token_env"),
+                ("model_context_limit", "context_limit"),
+            ]
+            .into_iter()
+            .filter_map(|(old, new)| table.remove(old).map(|value| (new.into(), value)))
+            .collect::<toml::Table>()
+            .try_into()?;
+            let mut models = ModelSettings::default();
+            if profile.provider == Some(Provider::OpenAiCompatible)
+                || (profile.provider.is_none() && !profile.url.trim().is_empty())
+            {
+                profile.provider = None;
+                models.mode = ModelMode::OpenAiCompatible;
+                models.openai = profile;
+            } else {
+                models.local = profile;
+            }
+            table.insert("models".into(), toml::Value::try_from(models)?);
         }
+        Ok(table)
     }
 
     pub fn save(&self) -> Result<()> {
         self.save_to(&Self::path()?)
     }
 
+    pub fn save_vm_models(
+        path: &Path,
+        previous: &ModelSettings,
+        models: &ModelSettings,
+    ) -> Result<()> {
+        let mut table = Self::read_settings(path)?;
+        let current: Self = table.clone().try_into()?;
+        let current = current.models;
+        ensure!(
+            &current == previous,
+            "Model settings changed. Reload them before saving."
+        );
+        models.connection(models.mode)?;
+        ensure!(
+            !models.profile(models.mode).name.trim().is_empty(),
+            "Enter a model name"
+        );
+        table.insert("models".into(), toml::Value::try_from(models)?);
+        Self::write_settings(path, &toml::to_string_pretty(&table)?)
+    }
+
+    pub fn save_vm_settings(
+        path: &Path,
+        previous: &VmSettings,
+        settings: &VmSettings,
+    ) -> Result<()> {
+        let mut table = Self::read_settings(path)?;
+        let current: Self = table.clone().try_into()?;
+        let mut current = VmSettings::from(current);
+        if previous.model_fallbacks.is_none() && settings.model_fallbacks.is_none() {
+            current.model_fallbacks = None;
+        }
+        ensure!(
+            current == *previous,
+            "VM settings changed. Reload them before saving."
+        );
+        if settings.models != previous.models {
+            settings.models.connection(settings.models.mode)?;
+            ensure!(
+                !settings
+                    .models
+                    .profile(settings.models.mode)
+                    .name
+                    .trim()
+                    .is_empty(),
+                "Enter a model name"
+            );
+            table.insert("models".into(), toml::Value::try_from(&settings.models)?);
+        }
+        if settings.model_fallbacks != previous.model_fallbacks {
+            let fallbacks = settings
+                .model_fallbacks
+                .as_ref()
+                .context("Missing model fallbacks")?;
+            fallbacks.validate()?;
+            table.insert("model_fallbacks".into(), toml::Value::try_from(fallbacks)?);
+        }
+        if settings.skills != previous.skills {
+            for (name, skill) in &settings.skills {
+                if previous.skills.get(name) != Some(skill) {
+                    let (registered, details) = Self::inspect_skill(&skill.path)?;
+                    ensure!(
+                        &registered == name && &details == skill,
+                        "Skill {name} changed. Add it again before saving."
+                    );
+                }
+            }
+            table.insert("skills".into(), toml::Value::try_from(&settings.skills)?);
+        }
+        if settings.mcp != previous.mcp {
+            for (name, server) in &settings.mcp {
+                if previous.mcp.get(name) != Some(server) {
+                    ensure!(valid_name(name), "Enter a valid MCP server name");
+                    match server {
+                        Mcp::Stdio { command, .. } => {
+                            ensure!(!command.trim().is_empty(), "Enter a command for {name}")
+                        }
+                        Mcp::Http { url, .. } => {
+                            let url = reqwest::Url::parse(url)
+                                .with_context(|| format!("Enter a valid URL for {name}"))?;
+                            ensure!(
+                                matches!(url.scheme(), "http" | "https")
+                                    && url.host_str().is_some(),
+                                "Use an HTTP or HTTPS URL for {name}"
+                            );
+                        }
+                    }
+                }
+            }
+            table.insert("mcp".into(), toml::Value::try_from(&settings.mcp)?);
+        }
+        if settings.auto_approve_tools != previous.auto_approve_tools {
+            table.insert(
+                "auto_approve_tools".into(),
+                settings.auto_approve_tools.into(),
+            );
+        }
+        Self::write_settings(path, &toml::to_string_pretty(&table)?)
+    }
+
+    pub fn update_saved_approvals(path: &Path, edit: impl FnOnce(&mut Self)) -> Result<()> {
+        let mut table = Self::read_settings(path)?;
+        let mut config: Self = table.clone().try_into()?;
+        edit(&mut config);
+        table.insert(
+            "terminal_approvals".into(),
+            toml::Value::try_from(&config.terminal_approvals)?,
+        );
+        table.insert(
+            "mcp_approvals".into(),
+            toml::Value::try_from(&config.mcp_approvals)?,
+        );
+        Self::write_settings(path, &toml::to_string_pretty(&table)?)
+    }
+
     fn save_to(&self, path: &Path) -> Result<()> {
+        Self::write_settings(path, &toml::to_string_pretty(self)?)
+    }
+
+    fn write_settings(path: &Path, text: &str) -> Result<()> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
-        let text = toml::to_string_pretty(self)?;
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         let mut file = fs::File::create(&temporary)?;
         file.write_all(text.as_bytes())?;
@@ -369,6 +523,12 @@ impl Config {
     }
 
     pub fn add_skill(&mut self, path: &Path) -> Result<String> {
+        let (name, skill) = Self::inspect_skill(path)?;
+        self.skills.insert(name.clone(), skill);
+        Ok(name)
+    }
+
+    pub fn inspect_skill(path: &Path) -> Result<(String, Skill)> {
         let path = if path.is_dir() {
             path.join("SKILL.md")
         } else {
@@ -381,7 +541,19 @@ impl Config {
             path.file_name().is_some_and(|name| name == "SKILL.md"),
             "Select a skill folder or SKILL.md"
         );
+        ensure!(path.is_file(), "SKILL.md must be a regular file");
         let text = fs::read_to_string(&path)?;
+        let header = Self::skill_header(&text)?;
+        Ok((
+            header.name,
+            Skill {
+                path,
+                description: header.description,
+            },
+        ))
+    }
+
+    fn skill_header(text: &str) -> Result<SkillHeader> {
         let mut lines = text.lines();
         ensure!(
             lines.next() == Some("---"),
@@ -397,19 +569,31 @@ impl Config {
             "SKILL.md needs a closing front matter delimiter and instructions"
         );
         let header: SkillHeader =
-            serde_yaml::from_str(&front_matter).context("SKILL.md needs name and description")?;
+            yaml_serde::from_str(&front_matter).context("SKILL.md needs name and description")?;
         ensure!(
             valid_name(&header.name) && !header.description.trim().is_empty(),
             "Use a letter, number, hyphen or underscore for the skill name and provide a description"
         );
-        self.skills.insert(
-            header.name.clone(),
-            Skill {
-                path,
-                description: header.description,
-            },
-        );
-        Ok(header.name)
+        Ok(header)
+    }
+
+    pub fn import_vm_skill(directory: &Path, text: &str) -> Result<(String, Skill)> {
+        let header = Self::skill_header(text)?;
+        let directory = directory.join(&header.name);
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("SKILL.md");
+        match fs::read_to_string(&path) {
+            Ok(existing) => ensure!(
+                existing == text,
+                "A different imported skill named {} already exists",
+                header.name
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::write_settings(&path, text)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Self::inspect_skill(&path)
     }
 
     pub fn skill_catalog(&self) -> String {
@@ -430,9 +614,12 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Mcp {
-    async fn discover(&self) -> Result<(RunningService<RoleClient, ()>, Vec<Tool>)> {
+    async fn discover(
+        &self,
+        workspace: Option<&Path>,
+    ) -> Result<(RunningService<RoleClient, ()>, Vec<Tool>)> {
         timeout(Duration::from_secs(12), async {
-            let client = self.connect().await?;
+            let client = self.connect(workspace).await?;
             let tools = client.list_all_tools().await?;
             Ok((client, tools))
         })
@@ -441,7 +628,15 @@ impl Mcp {
     }
 
     pub async fn test_connection(&self) -> Result<Vec<String>> {
-        let (_client, tools) = self.discover().await?;
+        self.test_connection_at(None).await
+    }
+
+    pub async fn test_vm_connection(&self, workspace: &Path) -> Result<Vec<String>> {
+        self.test_connection_at(Some(workspace)).await
+    }
+
+    async fn test_connection_at(&self, workspace: Option<&Path>) -> Result<Vec<String>> {
+        let (_client, tools) = self.discover(workspace).await?;
         Ok(tools
             .into_iter()
             .map(|tool| tool.name.into_owned())
@@ -480,11 +675,14 @@ impl Mcp {
         Ok(())
     }
 
-    async fn connect(&self) -> Result<RunningService<RoleClient, ()>> {
+    async fn connect(&self, workspace: Option<&Path>) -> Result<RunningService<RoleClient, ()>> {
         self.validate()?;
         match self {
             Self::Stdio { command, args } => {
-                let mut process = Command::new(command);
+                let mut process = match workspace {
+                    Some(workspace) => vm_command(command, workspace),
+                    None => Command::new(command),
+                };
                 process.args(args);
                 let transport = TokioChildProcess::new(process).context(
                     "Could not start the local MCP process. Check its launch command and PATH",
@@ -515,7 +713,7 @@ struct RemoteTool {
     definition: Value,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ToolActivity {
     pub name: String,
     pub action: Option<String>,
@@ -531,7 +729,7 @@ impl std::fmt::Display for ToolActivity {
     }
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub struct McpToolId {
     pub server: String,
     pub name: String,
@@ -628,9 +826,11 @@ impl<'a> ToolSet<'a> {
             remote: BTreeMap::new(),
         };
         let mut requests = tokio::task::JoinSet::new();
+        let workspace = config.vm_tools.then_some(&config.workspace);
         for (name, entry) in &config.mcp {
             let (name, entry) = (name.clone(), entry.clone());
-            requests.spawn(async move { (name, entry.discover().await) });
+            let workspace = workspace.cloned();
+            requests.spawn(async move { (name, entry.discover(workspace.as_deref()).await) });
         }
         let mut discovered = BTreeMap::new();
         while let Some(result) = requests.join_next().await {
@@ -892,6 +1092,7 @@ impl<'a> ToolSet<'a> {
                 let invocation: TerminalInvocation = serde_json::from_value(args)?;
                 run_process(
                     &self.config.workspace,
+                    self.config.vm_tools,
                     &invocation.command,
                     &invocation.args,
                 )
@@ -945,8 +1146,31 @@ async fn read_output(mut stream: impl AsyncRead + Unpin) -> std::io::Result<Stri
     Ok(text)
 }
 
-async fn run_process(workspace: &Path, executable: &str, args: &[String]) -> Result<String> {
-    let mut command = Command::new(executable);
+fn vm_command(executable: &str, workspace: &Path) -> Command {
+    let mut command = Command::new("/usr/bin/sudo");
+    command.env_clear().current_dir(workspace).args([
+        "-n",
+        "-u",
+        "pluto-tool",
+        "--",
+        "/usr/local/bin/pluto",
+        "--vm-run-tool",
+        executable,
+    ]);
+    command
+}
+
+async fn run_process(
+    workspace: &Path,
+    vm_tools: bool,
+    executable: &str,
+    args: &[String],
+) -> Result<String> {
+    let mut command = if vm_tools {
+        vm_command(executable, workspace)
+    } else {
+        Command::new(executable)
+    };
     command
         .args(args)
         .current_dir(workspace)
@@ -968,6 +1192,69 @@ async fn run_process(workspace: &Path, executable: &str, args: &[String]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_header_accepts_yaml_aliases_and_folded_descriptions() -> Result<()> {
+        let header = Config::skill_header(
+            r#"---
+name: sample-skill
+metadata:
+  summary: &summary >-
+    Format a report:
+    preserve the source details.
+description: *summary
+---
+Skill instructions.
+"#,
+        )?;
+        assert_eq!(header.name, "sample-skill");
+        assert_eq!(
+            header.description,
+            "Format a report: preserve the source details."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vm_settings_preserve_other_fields_and_reject_stale_edits() -> Result<()> {
+        let directory =
+            env::temp_dir().join(format!("pluto-vm-settings-test-{}", std::process::id()));
+        fs::create_dir(&directory)?;
+        let result = (|| -> Result<()> {
+            let path = directory.join("tools.toml");
+            fs::write(&path, "workspace = '/custom'\ncustom_value = 'preserve'\n")?;
+            let initial = VmSettings::from(Config::load_from(&path)?);
+            let mut edited = initial.clone();
+            edited.auto_approve_tools = true;
+            edited.mcp.insert(
+                "local".into(),
+                Mcp::Stdio {
+                    command: "/bin/true".into(),
+                    args: Vec::new(),
+                },
+            );
+            Config::save_vm_settings(&path, &initial, &edited)?;
+            let config = Config::load_from(&path)?;
+            assert_eq!(config.workspace, Path::new("/custom"));
+            assert!(VmSettings::from(config) == edited);
+            let document = Config::read_settings(&path)?;
+            assert_eq!(document["custom_value"].as_str(), Some("preserve"));
+            assert!(Config::save_vm_settings(&path, &initial, &initial).is_err());
+            let mut legacy = edited.clone();
+            legacy.model_fallbacks = None;
+            let mut legacy_update = legacy.clone();
+            legacy_update.auto_approve_tools = false;
+            Config::save_vm_settings(&path, &legacy, &legacy_update)?;
+            assert!(
+                VmSettings::from(Config::load_from(&path)?)
+                    .model_fallbacks
+                    .is_some()
+            );
+            Ok(())
+        })();
+        fs::remove_dir_all(directory)?;
+        result
+    }
 
     #[test]
     fn global_auto_approval_defaults_off_and_round_trips() -> Result<()> {

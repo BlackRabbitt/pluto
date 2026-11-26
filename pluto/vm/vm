@@ -1,0 +1,238 @@
+#!/bin/sh
+set -eu
+
+assets=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+instance=${PLUTO_INSTANCE:-${PLUTO_MACHINE:-pluto}}
+export LIMA_HOME="${PLUTO_LIMA_HOME:-$HOME/.pluto-lima}"
+validate_instance() {
+    case "$1" in
+        ''|-*|*[!a-zA-Z0-9_-]*) echo "Invalid Lima instance name" >&2; exit 2 ;;
+    esac
+}
+
+in_vm() {
+    limactl shell --tty=false --workdir=/ "$instance" "$@"
+}
+
+as_user() {
+    target=$1
+    shift
+    in_vm sudo -n -u "$target" -- "$@"
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+Manage Pluto VM, the optional sandbox for Pluto.
+
+Usage: pluto/vm/vm install [--latest]
+       pluto/vm/vm create INSTANCE
+       pluto/vm/vm build OUTPUT_BINARY
+       pluto/vm/vm setup PATH_TO_ALPINE_ARM64_PLUTO
+       pluto/vm/vm start | stop | status | api
+       pluto/vm/vm configure TOOLS_TOML
+       pluto/vm/vm import HOST_FILE WORKSPACE_NAME
+       pluto/vm/vm export WORKSPACE_NAME > HOST_FILE
+       pluto/vm/vm forward-model HOST_PORT [VM_PORT]
+USAGE
+    exit 2
+}
+
+filename() {
+    case "$1" in
+        ''|.*|*[!a-zA-Z0-9._-]*) echo "Use a simple workspace filename" >&2; exit 2 ;;
+    esac
+}
+
+port() {
+    case "$1" in
+        ''|*[!0-9]*) usage ;;
+    esac
+    [ "$1" -ge 1024 ] && [ "$1" -le 65535 ] || usage
+}
+
+if [ "${1:-}" = create ]; then
+    [ "$#" -eq 2 ] || usage
+    instance=$2
+    export PLUTO_INSTANCE="$instance"
+fi
+validate_instance "$instance"
+
+case "${1:-}" in
+    create)
+        instances=$(limactl list --format '{{.Name}}')
+        if printf '%s\n' "$instances" | grep -Fixq -- "$instance"; then
+            echo "A Lima instance named '$instance' already exists." >&2
+            exit 1
+        fi
+        staging=$(mktemp -d)
+        trap 'rm -rf -- "$staging"' EXIT
+        "$assets/vm" build "$staging/pluto"
+        limactl create --tty=false --name="$instance" "$assets/lima.yaml"
+        if ! "$assets/vm" setup "$staging/pluto"; then
+            echo "VM '$instance' was created. Run PLUTO_INSTANCE=$instance pluto/vm/vm install to finish setup." >&2
+            exit 1
+        fi
+        ;;
+    install)
+        case "${2:-}" in
+            '') [ "$#" -eq 1 ] || usage ;;
+            --latest)
+                [ "$#" -eq 2 ] || usage
+                source_dir=$(mktemp -d)
+                trap 'rm -rf -- "$source_dir"' EXIT
+                repository="$assets/../.."
+                branch=$(git -C "$repository" symbolic-ref --quiet --short HEAD) || {
+                    echo 'Select a branch with an upstream before using --latest.' >&2; exit 2;
+                }
+                remote=$(git -C "$repository" config --get "branch.$branch.remote" || true)
+                ref=$(git -C "$repository" config --get "branch.$branch.merge" || true)
+                if [ -z "$remote" ] || [ -z "$ref" ]; then
+                    echo 'Set an upstream for this branch before using --latest.' >&2; exit 2
+                fi
+                git -C "$repository" fetch --no-tags -- "$remote" "$ref"
+                git -C "$repository" archive --output="$source_dir/source.tar" FETCH_HEAD pluto
+                tar -C "$source_dir" -xf "$source_dir/source.tar"
+                "$source_dir/pluto/vm/vm" install
+                exit
+                ;;
+            *) usage ;;
+        esac
+        staging=$(mktemp -d)
+        trap 'rm -rf -- "$staging"' EXIT
+        "$assets/vm" build "$staging/pluto"
+        "$assets/vm" setup "$staging/pluto"
+        ;;
+    build)
+        [ "$#" -eq 2 ] && [ -n "$2" ] && [ ! -d "$2" ] || usage
+        [ "$(uname -s):$(uname -m)" = Darwin:arm64 ] || {
+            echo 'Building Pluto VM requires an Apple Silicon Mac.' >&2; exit 2;
+        }
+        command -v limactl >/dev/null 2>&1 || {
+            echo 'Install Lima before building Pluto VM.' >&2; exit 2;
+        }
+        builder=${PLUTO_BUILDER:-pluto-builder}
+        case "$builder" in
+            ''|-*|*[!a-zA-Z0-9_-]*) echo 'Invalid Lima builder name' >&2; exit 2 ;;
+        esac
+        [ "$builder" != "$instance" ] || {
+            echo 'Use different names for the builder and Pluto VM.' >&2; exit 2;
+        }
+        output_dir=$(dirname -- "$2")
+        mkdir -p -- "$output_dir"
+        staging=$(mktemp -d "$output_dir/.pluto-build.XXXXXX")
+        stop_builder=false
+        trap 'if "$stop_builder"; then limactl stop --tty=false "$builder" >&2 || true; fi; rm -rf -- "$staging"' EXIT
+        status=$(limactl list --format '{{.Name}} {{.Status}}')
+        if printf '%s\n' "$status" | grep -Fqx "$builder Running"; then
+            :
+        elif printf '%s\n' "$status" | cut -d ' ' -f1 | grep -Fxq "$builder"; then
+            stop_builder=true
+            limactl start --tty=false "$builder" >&2
+        else
+            stop_builder=true
+            limactl start --tty=false --name="$builder" --memory=3 --disk=8 "$assets/lima.yaml" >&2
+        fi
+        COPYFILE_DISABLE=1 tar -C "$assets/.." -cf "$staging/source.tar" Cargo.toml Cargo.lock src
+        limactl shell --tty=false --workdir=/ "$builder" sh -ec '
+            source_dir=$(mktemp -d /tmp/pluto-build.XXXXXX)
+            trap '\''rm -rf -- "$source_dir"'\'' EXIT
+            cd "$source_dir"
+            tar -xf -
+            if ! command -v cc >/dev/null || ! command -v curl >/dev/null || ! command -v strip >/dev/null; then
+                sudo -n apk add --no-progress build-base curl ca-certificates >&2
+            fi
+            if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+                curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs -o rustup.sh
+                sh rustup.sh -y --profile minimal --default-toolchain 1.100.0 >&2
+            fi
+            . "$HOME/.cargo/env"
+            if ! rustup run 1.100.0 rustc --version >/dev/null 2>&1; then
+                rustup toolchain install 1.100.0 --profile minimal >&2
+            fi
+            build_dir="$HOME/.cache/pluto-build"
+            cargo +1.100.0 build --locked --release --target-dir "$build_dir"
+            strip -o "$source_dir/pluto" "$build_dir/release/pluto"
+            cat "$source_dir/pluto"
+        ' < "$staging/source.tar" > "$staging/pluto"
+        test -s "$staging/pluto"
+        chmod 0755 "$staging/pluto"
+        mv -f -- "$staging/pluto" "$2"
+        ;;
+    setup)
+        [ "$#" -eq 2 ] && [ -f "$2" ] || usage
+        if limactl list --format '{{.Name}}' | grep -Fxq "$instance"; then
+            limactl start --tty=false "$instance"
+        else
+            limactl start --tty=false --name="$instance" "$assets/lima.yaml"
+        fi
+        staging=$(mktemp -d)
+        trap 'rm -rf -- "$staging"' EXIT
+        cp "$2" "$staging/pluto"
+        cp "$assets/setup-vm.sh" "$assets/pluto.init" "$staging/"
+        COPYFILE_DISABLE=1 tar -C "$staging" -cf "$staging/setup.tar" pluto setup-vm.sh pluto.init
+        # shellcheck disable=SC2016
+        in_vm sudo -n -- sh -c '
+            set -eu
+            dir=$(mktemp -d)
+            trap '\''rm -rf -- "$dir"'\'' EXIT
+            cd "$dir"
+            tar -xf -
+            sh setup-vm.sh
+        ' < "$staging/setup.tar"
+        ;;
+    start|stop)
+        [ "$#" -eq 1 ] || usage
+        limactl "$1" --tty=false "$instance"
+        ;;
+    status)
+        [ "$#" -eq 1 ] || usage
+        limactl list "$instance"
+        ;;
+    api)
+        [ "$#" -eq 1 ] || usage
+        as_user pluto-api /usr/local/bin/pluto --vm-connect /run/pluto/api.sock
+        ;;
+    configure)
+        [ "$#" -eq 2 ] && [ -f "$2" ] || usage
+        # shellcheck disable=SC2016
+        as_user pluto-api sh -c '
+            set -eu
+            umask 077
+            tmp=$(mktemp /var/lib/pluto/settings.XXXXXX)
+            trap '\''rm -f -- "$tmp"'\'' EXIT
+            cat > "$tmp"
+            mv -fT -- "$tmp" /var/lib/pluto/tools.toml
+        ' < "$2"
+        ;;
+    import)
+        [ "$#" -eq 3 ] && [ -f "$2" ] || usage
+        filename "$3"
+        # shellcheck disable=SC2016
+        as_user pluto-tool sh -c '
+            set -eu
+            cd /var/lib/pluto-workspace
+            tmp=$(mktemp .import.XXXXXX)
+            trap '\''rm -f -- "$tmp"'\'' EXIT
+            cat > "$tmp"
+            mv -fT -- "$tmp" "./$1"
+        ' sh "$3" < "$2"
+        ;;
+    export)
+        [ "$#" -eq 2 ] || usage
+        filename "$2"
+        as_user pluto-tool cat -- "/var/lib/pluto-workspace/$2"
+        ;;
+    forward-model)
+        [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage
+        model_host_port=$2
+        model_vm_port=${3:-$2}
+        port "$model_host_port"
+        port "$model_vm_port"
+        limactl start --tty=false "$instance"
+        # Use our own connection so stopping the tunnel leaves Lima's SSH master alone.
+        exec ssh -F "$LIMA_HOME/$instance/ssh.config" -S none -NT \
+            -o ExitOnForwardFailure=yes \
+            -R "127.0.0.1:$model_vm_port:127.0.0.1:$model_host_port" "lima-$instance"
+        ;;
+    *) usage ;;
+esac
