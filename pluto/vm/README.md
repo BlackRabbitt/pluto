@@ -305,8 +305,11 @@ Run only the build command if you just need the binary. To update an existing ru
 | Start for file transfers or model forwarding | `pluto/vm/vm start` |
 | Import a file as `sales.csv` in the VM | `pluto/vm/vm import sales.csv sales.csv` |
 | Export a report Pluto wrote | `pluto/vm/vm export report.csv > report.csv` |
-| Upload or download a whole folder | [Use `import --folder` or `export --folder`](#copy-whole-folders-between-mac-and-vm) |
+| Upload a whole folder to the VM workspace | `pluto/vm/vm import --folder HOST_FOLDER WORKSPACE_NAME` |
+| Download a workspace folder as a ZIP | `pluto/vm/vm export --folder WORKSPACE_NAME > HOST_ZIP` |
 | Stop the VM | `pluto/vm/vm stop` |
+
+See [Copy whole folders between Mac and VM](#copy-whole-folders-between-mac-and-vm) for setup and examples.
 
 Setup copies earlier OpenRC settings to `/etc/conf.d/pluto` if that file is absent.
 
@@ -400,15 +403,16 @@ The result is `/var/lib/pluto-workspace/My Project/`. The destination name must 
 
 ### Download a folder from VM to Mac
 
-Pass the name of a folder directly under `/var/lib/pluto-workspace/` and redirect the ZIP to a file on your Mac. The archive contains the top-level folder and its contents.
+Pass the name of a folder directly under `/var/lib/pluto-workspace/` and redirect the ZIP to a file on your Mac. The archive contains the top-level folder and its contents. Use a fresh ZIP filename to keep an earlier download because `>` overwrites the file at that path.
 
 ```sh
 pluto/vm/vm export --folder "My Project" > "$HOME/Downloads/my-project.zip"
 ```
 
-You can keep the ZIP and unpack it later. `unzip -n` keeps existing files at the destination.
+Use `unzip -l` to list the archive contents whenever you want to check the download. When you’re ready to unpack it, `unzip -n` keeps existing files at the destination.
 
 ```sh
+unzip -l "$HOME/Downloads/my-project.zip"
 unzip -n "$HOME/Downloads/my-project.zip" -d "$HOME/Downloads"
 ```
 
