@@ -2,7 +2,7 @@
 
 Pluto VM is the optional Alpine Linux sandbox for Pluto, the assistant. Its virtual disk keeps your workspace and conversation between restarts. Connect with Pluto Desktop, the Mac app, or use the API from Terminal.
 
-[Use Pluto from Terminal](#use-pluto-without-desktop) · [Set environment variables](#environment-variables-in-pluto-vm) · [Update Pluto in your existing VM](#update-pluto-vm)
+[Use Pluto from Terminal](#use-pluto-without-desktop) · [Copy folders](#copy-whole-folders-between-mac-and-vm) · [Find files and settings](#files-and-diagnostics) · [Set environment variables](#environment-variables-in-pluto-vm) · [Update Pluto in your existing VM](#update-pluto-vm)
 
 ## Quick start
 
@@ -305,6 +305,7 @@ Run only the build command if you just need the binary. To update an existing ru
 | Start for file transfers or model forwarding | `pluto/vm/vm start` |
 | Import a file as `sales.csv` in the VM | `pluto/vm/vm import sales.csv sales.csv` |
 | Export a report Pluto wrote | `pluto/vm/vm export report.csv > report.csv` |
+| Upload or download a whole folder | [Use `import --folder` or `export --folder`](#copy-whole-folders-between-mac-and-vm) |
 | Stop the VM | `pluto/vm/vm stop` |
 
 Setup copies earlier OpenRC settings to `/etc/conf.d/pluto` if that file is absent.
@@ -329,21 +330,101 @@ Keep `PLUTO_LIMA_HOME` the same to use the existing storage location. Set `PLUTO
 
 ## Files and diagnostics
 
-Each instance has its own primary disk image on the Mac, usually `~/.pluto-lima/<instance>/disk`. Lima initializes it from the Alpine image and gives it 4 GiB of capacity by default. The file is sparse, so its host storage grows as data is written. Stop, restart, and Pluto updates reuse the same disk. [Lima instance storage](https://lima-vm.io/docs/dev/internals/)
-
-These paths are inside the VM.
+### Guest login in the VM
 
 | Path | Contents |
 | --- | --- |
-| `/var/lib/pluto/tools.toml` | Service settings |
-| `/var/lib/pluto/chats/` | Saved conversations |
-| `/var/lib/pluto-workspace/` | Imported files and tool output |
-| `/var/lib/pluto/diagnostics.jsonl` | Model, tool, and approval events |
-| `/var/lib/pluto/service.log` | OpenRC service errors |
+| `$HOME` | Home directory for the guest account you use with `limactl shell`. Run `echo "$HOME"` in that shell to see the full path. |
+| `~/.profile` | Startup settings for that account’s login shell. |
 
-For startup problems, run `rc-service pluto status` as root inside the VM. For turn problems, check `diagnostics.jsonl` and its rotated copy, `diagnostics.previous.jsonl`.
+### Pluto tools in the VM (`pluto-tool`)
+
+| Path | Contents |
+| --- | --- |
+| `/var/lib/pluto-workspace/` | Workspace and `HOME` for Pluto’s terminal commands and local MCP servers. Put imported projects, skill folders, and supporting files here. Register each skill or MCP server using its path inside the VM. |
+
+### Pluto service in the VM (`pluto-api`)
+
+| Path | Contents |
+| --- | --- |
+| `/var/lib/pluto/` | Private service home and persistent state. |
+| `/var/lib/pluto/tools.toml` | Per-VM settings for models, registered skills, MCP servers, and approvals. Both the Local only and OpenAI-compatible model profiles live here. |
+| `/var/lib/pluto/chats/` | Saved conversations. |
+| `/var/lib/pluto/diagnostics.jsonl` | Model, tool, and approval events. Older events may be in `diagnostics.previous.jsonl` in the same directory. |
+| `/var/lib/pluto/service.log` | OpenRC service errors. |
+| `/usr/local/bin/pluto` | Installed Linux application binary. |
+| `/etc/init.d/pluto` | OpenRC startup script. |
+| `/etc/conf.d/pluto` | Root-managed service environment, including API keys you configure there. |
+| `/run/pluto/api.sock` | Private Unix socket Pluto Desktop and `vm api` reach over SSH. |
+
+For startup problems, run `rc-service pluto status` as root inside the VM. For turn problems, check the diagnostics log.
+
+### Standalone on the Mac
+
+| Path | Contents |
+| --- | --- |
+| `~/Library/Application Support/pluto/tools.toml` | Default Standalone settings. `PLUTO_CONFIG` can override the location. |
+| Workspace selected in Standalone settings | Folder where Pluto runs tools on your Mac. It defaults to the working directory at launch. |
+| `~/Applications/Pluto.app` | Pluto Desktop app installed by the repo’s Mac installer. The same app can connect to a VM. |
+
+Lima stores each VM’s disk on the Mac, usually at `~/.pluto-lima/<instance>/disk`. When `PLUTO_LIMA_HOME` is set, Lima uses that directory for Pluto VM instances. Each instance has its own workspace, settings, and chats, which persist through restarts and updates. [Lima instance storage](https://lima-vm.io/docs/dev/internals/)
 
 Pluto VM uses 2 CPUs, 512 MiB RAM, and a sparse 4 GiB disk by default. It has outbound networking. Lima disables shared mounts, automatic port forwards, and the host-loopback alias. Terminal commands and local stdio MCP servers run under a separate account with a clean environment. They can reach the explicitly forwarded model port.
+
+## Copy whole folders between Mac and VM
+
+Run these commands from the repository root on your Mac. Replace `plutoVM` with the instance name in **Settings → Connection**. The default instance name is `pluto`. Start the VM if it’s stopped.
+
+```sh
+export PLUTO_INSTANCE=plutoVM
+pluto/vm/vm start
+```
+
+New VM installs include `zip` and `unzip`. If your VM was set up before folder transfers were added, install the utilities once.
+
+```sh
+export LIMA_HOME="${PLUTO_LIMA_HOME:-$HOME/.pluto-lima}"
+limactl shell --tty=false --workdir=/ "$PLUTO_INSTANCE" \
+  sudo -n apk add --no-progress zip unzip
+```
+
+### Upload a folder from Mac to VM
+
+Pass a folder on your Mac and a name for it in the workspace. Quote paths and names that contain spaces. Pluto creates a temporary ZIP, uploads it, and unpacks it as `pluto-tool`.
+
+```sh
+pluto/vm/vm import --folder "$HOME/Documents/My Project" "My Project"
+```
+
+The result is `/var/lib/pluto-workspace/My Project/`. The destination name must be a single folder name. If that name already exists, choose another one. Hidden files, empty subfolders, and symbolic links are included.
+
+### Download a folder from VM to Mac
+
+Pass the name of a folder directly under `/var/lib/pluto-workspace/` and redirect the ZIP to a file on your Mac. The archive contains the top-level folder and its contents.
+
+```sh
+pluto/vm/vm export --folder "My Project" > "$HOME/Downloads/my-project.zip"
+```
+
+You can keep the ZIP and unpack it later. `unzip -n` keeps existing files at the destination.
+
+```sh
+unzip -n "$HOME/Downloads/my-project.zip" -d "$HOME/Downloads"
+```
+
+For an existing ZIP file, use the [single-file commands](#run-and-move-files). For a folder outside the Pluto workspace that your Lima guest login can read, stream its ZIP from a guest shell.
+
+```sh
+export LIMA_HOME="${PLUTO_LIMA_HOME:-$HOME/.pluto-lima}"
+vm_folder='/path/inside/the/vm/My Project'
+limactl shell --tty=false --workdir=/ "$PLUTO_INSTANCE" sh -ec '
+  staging=$(mktemp -d)
+  trap '\''rm -rf -- "$staging"'\'' EXIT
+  cd "$(dirname "$1")"
+  zip -qry -MM "$staging/folder.zip" "./$(basename "$1")"
+  cat "$staging/folder.zip"
+' sh "$vm_folder" > "$HOME/Downloads/my-project.zip"
+```
 
 ## API
 
@@ -382,4 +463,4 @@ python3 -B pluto/tests/vm_smoke.py
 pluto/vm/vm stop
 ```
 
-The fixture checks model settings, skill and MCP selection, tool accounts, context usage, and approval decisions. A cold restart verifies the saved report, recent and archived chats, and saved approvals. Run the [Desktop tests](../../DEVELOPMENT.md#verify-a-change) for the shared controls.
+The fixture checks folder transfers, model settings, skill and MCP selection, tool accounts, context usage, and approval decisions. A cold restart verifies the saved report, recent and archived chats, and saved approvals. Run the [Desktop tests](../../DEVELOPMENT.md#verify-a-change) for the shared controls.
