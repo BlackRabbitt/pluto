@@ -1,5 +1,5 @@
 use crate::{
-    agent::{TokenUsage, ToolPhase, TurnSelection},
+    agent::{TokenUsage, ToolPhase, ToolResult, TurnSelection},
     history::ChatHistory,
     model_fallback::FallbackModel,
     providers::{FallbackMetadata, Provider, ThinkingLevel, ThinkingSetting},
@@ -133,6 +133,8 @@ pub enum Response {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         update: Option<ChatUpdate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<ChatActivityUpdate>,
     },
     Warning {
         message: String,
@@ -187,6 +189,13 @@ pub enum ChatUpdate {
         provider: Provider,
         context_window: Option<u64>,
     },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatActivityUpdate {
+    ToolResult { result: ToolResult },
+    ReviewingToolResults,
 }
 
 pub async fn read_message<T: DeserializeOwned>(

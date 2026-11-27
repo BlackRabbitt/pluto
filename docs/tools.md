@@ -68,6 +68,8 @@ Quit and reopen Pluto Desktop. For a remote MCP server, enter `MCP_TOKEN` in **B
 
 In both modes, Pluto asks before running a terminal command or calling an MCP tool. Chat shows the tool name, action, elapsed time, and approval status below your latest message.
 
+Activity rows show the skills Pluto loaded and the tool results the model is reviewing. Click a skill or result row to expand the exact text sent to the model, including any truncation notice. The expanded output scrolls horizontally for long lines. Activity stays available while the chat is open.
+
 | Approval | What it allows |
 | --- | --- |
 | **Run once** | Approves the current call. |

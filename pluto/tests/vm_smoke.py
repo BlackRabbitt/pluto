@@ -133,8 +133,8 @@ def api(request, approvals=(), updates=None):
                 else:
                     decision["accept"] = answer
                 send(decision)
-            elif updates is not None and "update" in event:
-                updates.append(event["update"])
+            elif updates is not None and ("update" in event or "activity" in event):
+                updates.append(event.get("update") or event["activity"])
             elif kind == "history":
                 history = event
                 chats = event.get("chats", chats)
@@ -269,6 +269,10 @@ name = "vm-fixture"
                 assert {"kind": "skill", "name": "vm-smoke-skill"} in updates, updates
                 assert {"kind": "usage", "tokens": {"input": 47, "output": 11}} in updates, updates
                 assert any(update["kind"] == "tool" for update in updates), updates
+                results = [update["result"] for update in updates if update["kind"] == "tool_result"]
+                assert any(result["loaded_skill"] and result["activity"]["name"] == "vm-smoke-skill" for result in results)
+                assert any("books,25" in result["output"] for result in results)
+                assert any(update["kind"] == "reviewing_tool_results" for update in updates)
                 new_id, new_messages, chats = api({"type": "send_chat", "chat_id": None, "prompt": NEW_PROMPT})
             finally:
                 if tunnel.poll() is None:

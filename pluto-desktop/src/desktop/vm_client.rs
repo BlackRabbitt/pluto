@@ -1,18 +1,20 @@
 use super::{
-    ApprovalDecision, ApprovalRequest, ChatComposer, CommonMarkCache, Desktop, Lookup,
-    PickerCatalog, chat_list, chat_title, chat_transcript, context_usage, egui, field,
+    ApprovalDecision, ApprovalRequest, ChatActivity, ChatComposer, CommonMarkCache, Desktop,
+    Lookup, PickerCatalog, chat_list, chat_title, chat_transcript, context_usage, egui, field,
     thinking_picker, tool_approval_dialog, vm_files::VmFiles, vm_settings::VmSettingsForm,
 };
 use anyhow::{Context, Result, bail, ensure};
 use pluto::{
     agent::{TokenUsage, ToolProgress, TurnSelection},
-    api::{ApprovalScope, ChatSummary, ChatUpdate, Request, Response, read_message, write_message},
+    api::{
+        ApprovalScope, ChatActivityUpdate, ChatSummary, ChatUpdate, Request, Response,
+        read_message, write_message,
+    },
     history::ChatHistory,
     providers::{Provider, ThinkingLevel, ThinkingSetting},
     tools::{ApprovalRule, Config, ModelMode, valid_name},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
     process::Stdio,
@@ -562,7 +564,7 @@ pub(super) struct VmClient {
     context_usage: Option<TokenUsage>,
     tool_progress: Option<ToolProgress>,
     switched_model: Option<(Provider, Option<u64>)>,
-    loaded_skills: BTreeMap<usize, BTreeSet<String>>,
+    chat_activity: ChatActivity,
     chat_warnings: Vec<String>,
     saved_approvals: Lookup<Vec<ApprovalRule>>,
     pending_send: Option<(String, TurnSelection)>,
@@ -641,7 +643,7 @@ impl VmClient {
             context_usage: None,
             tool_progress: None,
             switched_model: None,
-            loaded_skills: BTreeMap::new(),
+            chat_activity: ChatActivity::default(),
             chat_warnings: Vec::new(),
             saved_approvals: Lookup::Idle,
             pending_send: None,
@@ -668,6 +670,7 @@ impl VmClient {
         }
         self.warning = None;
         self.tool_progress = None;
+        self.chat_activity.stop_review();
         self.status = match &request {
             Request::History => "Connecting to Pluto VM…",
             Request::OpenChat { .. } => "Opening saved chat…",
@@ -735,7 +738,7 @@ impl VmClient {
         self.composer.picker_catalog = Lookup::Idle;
         self.context_usage = None;
         self.switched_model = None;
-        self.loaded_skills.clear();
+        self.chat_activity = ChatActivity::default();
         self.chat_warnings.clear();
     }
 
@@ -957,7 +960,7 @@ impl VmClient {
             &self.history,
             &mut self.markdown,
             &self.chat_warnings,
-            &self.loaded_skills,
+            &self.chat_activity,
             self.ready,
             |ui| {
                 if let Some(warning) = warning {
@@ -972,7 +975,8 @@ impl VmClient {
                 } else if let Some(tool) = &self.tool_progress {
                     super::tool_progress_ui(ui, tool);
                 } else if busy && !status.is_empty() {
-                    super::chat_progress(ui, status);
+                    let heading = self.chat_activity.review_heading();
+                    super::chat_progress(ui, heading.as_deref().unwrap_or(status));
                 }
             },
         );
@@ -1054,7 +1058,7 @@ impl VmClient {
             }
             ChatUpdate::Skill { name } => {
                 if let Some(index) = self.history.messages().len().checked_sub(1) {
-                    self.loaded_skills.entry(index).or_default().insert(name);
+                    self.chat_activity.skill_loaded(index, name);
                 }
             }
             ChatUpdate::Usage { tokens } => self.context_usage = tokens,
@@ -1234,13 +1238,31 @@ impl eframe::App for VmClient {
                     self.saved_approvals = Lookup::Complete(Ok(rules));
                     self.settings_status = Some("Approval removed".into());
                 }
-                ClientEvent::Response(Response::Status { message, update }) => {
+                ClientEvent::Response(Response::Status {
+                    message,
+                    update,
+                    activity,
+                }) => {
                     if !message.is_empty() {
                         self.status = message;
                         self.tool_progress = None;
+                        self.chat_activity.stop_review();
                     }
                     if let Some(update) = update {
                         self.chat_update(update);
+                    }
+                    if let Some(activity) = activity
+                        && let Some(index) = self.history.messages().len().checked_sub(1)
+                    {
+                        match activity {
+                            ChatActivityUpdate::ToolResult { result } => {
+                                self.tool_progress = None;
+                                self.chat_activity.result(index, result);
+                            }
+                            ChatActivityUpdate::ReviewingToolResults => {
+                                self.chat_activity.start_review(index)
+                            }
+                        }
                     }
                 }
                 ClientEvent::Response(Response::Warning { message, update }) => {
@@ -1254,6 +1276,7 @@ impl eframe::App for VmClient {
                     if decision.retry {
                         self.page = VmPage::Chat;
                         self.tool_progress = None;
+                        self.chat_activity.stop_review();
                     }
                     self.decision = Some(decision);
                 }
@@ -1261,6 +1284,7 @@ impl eframe::App for VmClient {
                     self.busy = false;
                     self.decision = None;
                     self.tool_progress = None;
+                    self.chat_activity.stop_review();
                     self.status.clear();
                     if let Err(error) = result {
                         if let Some((prompt, selection)) = self.pending_send.take() {

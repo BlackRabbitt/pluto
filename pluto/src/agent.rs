@@ -72,6 +72,7 @@ pub enum Event {
         context_window: Option<u64>,
     },
     Tool(ToolProgress),
+    ToolResult(ToolResult),
     SkillLoaded(String),
     Warning(String),
     Approve(ApprovalRequest, oneshot::Sender<ApprovalDecision>),
@@ -102,6 +103,13 @@ pub struct ToolProgress {
     pub activity: ToolActivity,
     pub phase: ToolPhase,
     pub started: Instant,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct ToolResult {
+    pub activity: ToolActivity,
+    pub output: String,
+    pub loaded_skill: bool,
 }
 
 impl Event {
@@ -237,8 +245,10 @@ pub async fn chat(
             .into_iter()
             .map(|(role, content)| json!({"role": role, "content": content})),
     );
+    let preloaded_skills = !selection.skills.is_empty();
     for (index, name) in selection.skills.into_iter().enumerate() {
         let arguments = json!({"name": name});
+        let activity = tools.activity("load_skill", &arguments);
         let instructions = load_skill(&tools, arguments.clone(), trace, &emit)
             .await
             .with_context(|| format!("Could not load skill {name}"))?;
@@ -249,7 +259,7 @@ pub async fn chat(
                 "function": {"name": "load_skill", "arguments": arguments.to_string()}
             }]
         }));
-        messages.push(json!({"role":"tool","tool_call_id":call_id,"content":bounded_tool_output(instructions)}));
+        append_tool_result(&mut messages, &emit, &call_id, activity, instructions, true);
     }
 
     let mut tool_calls = 0;
@@ -259,7 +269,7 @@ pub async fn chat(
         let finalizing = handoff.is_some();
         let phase = if finalizing {
             ModelPhase::WritingPartialAnswer
-        } else if tool_calls == 0 {
+        } else if tool_calls == 0 && !preloaded_skills {
             ModelPhase::Thinking
         } else {
             ModelPhase::ReviewingToolResults
@@ -500,9 +510,11 @@ pub async fn chat(
             let raw = call["function"]["arguments"].as_str().unwrap_or("{}");
             let started = Instant::now();
             trace.record("tool_requested", || json!({"call": tool_calls, "tool": name.chars().take(128).collect::<String>(), "arguments_id": trace.arguments_id(raw)}));
-            let result = match serde_json::from_str::<Value>(raw) {
+            let arguments = serde_json::from_str::<Value>(raw);
+            let activity = tools.activity(name, arguments.as_ref().unwrap_or(&Value::Null));
+            let result = match arguments {
                 Ok(args) if args.is_object() && name == "find_tools" => {
-                    emit(Event::tool(tools.activity(name, &args), ToolPhase::Running));
+                    emit(Event::tool(activity.clone(), ToolPhase::Running));
                     tools.find_tools(args, &mut newly_found)
                 }
                 Ok(args) if args.is_object() && name == "load_skill" => {
@@ -514,7 +526,6 @@ pub async fn chat(
                     ))
                 }
                 Ok(args) if args.is_object() => {
-                    let activity = tools.activity(name, &args);
                     let mut phase = ToolPhase::Running;
                     if let Some(request) = tools.approval(name, &args) {
                         let approval_started = Instant::now();
@@ -538,7 +549,14 @@ pub async fn chat(
                         }}));
                         match decision {
                             ApprovalDecision::Decline => {
-                                messages.push(json!({"role":"tool","tool_call_id":id,"content":"The user declined this action. Do not retry it."}));
+                                append_tool_result(
+                                    &mut messages,
+                                    &emit,
+                                    id,
+                                    activity,
+                                    "The user declined this action. Do not retry it.".into(),
+                                    false,
+                                );
                                 continue;
                             }
                             ApprovalDecision::RunOnce => {}
@@ -551,15 +569,15 @@ pub async fn chat(
                             }
                         }
                     }
-                    emit(Event::tool(activity, phase));
+                    emit(Event::tool(activity.clone(), phase));
                     tools.call(name, args).await
                 }
                 _ => Err(anyhow::anyhow!("Tool arguments must be a JSON object")),
             };
             trace.record("tool_finished", || json!({"call": tool_calls, "duration_ms": started.elapsed().as_millis(), "outcome": if result.is_ok() { "returned" } else { "error" }, "result_bytes": result.as_ref().ok().map(String::len)}));
+            let loaded_skill = name == "load_skill" && result.is_ok();
             let output = result.unwrap_or_else(|error| format!("Tool error: {error:#}"));
-            let content = bounded_tool_output(output);
-            messages.push(json!({"role":"tool","tool_call_id":id,"content":content}));
+            append_tool_result(&mut messages, &emit, id, activity, output, loaded_skill);
         }
         let previous_count = active_mcp_tools.len();
         if !newly_found.is_empty() {
@@ -657,6 +675,23 @@ async fn load_skill(
     let instructions = instructions?;
     emit(Event::SkillLoaded(name));
     Ok(instructions)
+}
+
+fn append_tool_result(
+    messages: &mut Vec<Value>,
+    emit: &impl Fn(Event),
+    id: &str,
+    activity: ToolActivity,
+    output: String,
+    loaded_skill: bool,
+) {
+    let output = bounded_tool_output(output);
+    messages.push(json!({"role":"tool","tool_call_id":id,"content":output}));
+    emit(Event::ToolResult(ToolResult {
+        activity,
+        output,
+        loaded_skill,
+    }));
 }
 
 fn bounded_tool_output(output: String) -> String {
