@@ -37,6 +37,7 @@ Usage: pluto/vm/vm install [--latest]
        pluto/vm/vm export WORKSPACE_NAME > HOST_FILE
        pluto/vm/vm export --path WORKSPACE_PATH > HOST_FILE
        pluto/vm/vm export --folder WORKSPACE_PATH > HOST_ZIP
+       pluto/vm/vm remove --file|--folder WORKSPACE_PATH
        pluto/vm/vm forward-model HOST_PORT [VM_PORT]
 USAGE
     exit 2
@@ -50,11 +51,14 @@ filename() {
 
 folder_path() {
     workspace_path=${1#/var/lib/pluto-workspace/}
+    while [ "${workspace_path%/}" != "$workspace_path" ]; do
+        workspace_path=${workspace_path%/}
+    done
     case "/$workspace_path/" in
-        //*|*/../*) echo "Use a folder path under /var/lib/pluto-workspace, without .." >&2; exit 2 ;;
+        //*|*/../*) echo "Use an item path under /var/lib/pluto-workspace, without .." >&2; exit 2 ;;
     esac
-    if [ "$(basename -- "$workspace_path")" = . ]; then
-        echo "Specify a folder name at the end of the workspace path" >&2
+    if [ "${workspace_path##*/}" = . ]; then
+        echo "Specify an item at the end of the workspace path" >&2
         exit 2
     fi
 }
@@ -64,27 +68,35 @@ workspace_access() {
     as_user pluto-tool sh -ec '
         cd -P /var/lib/pluto-workspace
         workspace=$PWD
+        require_zip_tool() {
+            if ! command -v "$1" >/dev/null 2>&1; then
+                printf "The VM is missing %s. In the VM, run: sudo apk add zip unzip\n" "$1" >&2
+                exit 1
+            fi
+        }
         if [ "$1" = import-folder ]; then
+            require_zip_tool unzip
             staging=$(mktemp -d "$workspace/.import.XXXXXX")
             trap '\''rm -rf -- "$staging"'\'' EXIT
             cat > "$staging/folder.zip"
             unzip -q "$staging/folder.zip" -d "$staging/content"
         fi
 
-        folder=./$(basename -- "$2")
+        folder=./${2##*/}
         if [ "$1" = list ]; then
             parent=$2
         else
-            parent=$(dirname -- "$2")
+            parent=${2%/*}
+            if [ "$parent" = "$2" ]; then parent=.; fi
         fi
         while [ -n "$parent" ]; do
             component=${parent%%/*}
             parent=${parent#"$component"}
             parent=${parent#/}
             case "$component" in ""|.) continue ;; esac
-            if [ "$1" = import-folder ] && [ ! -d "./$component" ]; then
-                mkdir -p -- "./$component"
-            fi
+            case "$1" in
+                import-file|import-folder) mkdir -p -- "./$component" ;;
+            esac
             cd -P -- "./$component"
             case "$PWD/" in
                 "$workspace/"*) ;;
@@ -109,12 +121,16 @@ workspace_access() {
             cat > "$temp_file"
             ln -T -- "$temp_file" "$folder"
             ;;
-        export-file)
+        export-file|remove-file)
             if [ ! -f "$folder" ] || [ -L "$folder" ]; then
                 printf "Workspace file not found: %s\n" "$2" >&2
                 exit 1
             fi
-            cat "$folder"
+            if [ "$1" = remove-file ]; then
+                rm -- "$folder"
+            else
+                cat "$folder"
+            fi
             ;;
         import-folder)
             # Reserve the destination so concurrent imports cannot replace it.
@@ -124,15 +140,20 @@ workspace_access() {
                 exit 1
             fi
             ;;
-        export-folder)
+        export-folder|remove-folder)
             if [ ! -d "$folder" ] || [ -L "$folder" ]; then
                 printf "Workspace folder not found: %s\n" "$2" >&2
                 exit 1
             fi
-            staging=$(mktemp -d)
-            trap '\''rm -rf -- "$staging"'\'' EXIT
-            zip -qry -MM "$staging/folder.zip" "$folder"
-            cat "$staging/folder.zip"
+            if [ "$1" = remove-folder ]; then
+                rm -r -- "$folder"
+            else
+                require_zip_tool zip
+                staging=$(mktemp -d)
+                trap '\''rm -rf -- "$staging"'\'' EXIT
+                zip -qry -MM "$staging/folder.zip" "$folder"
+                cat "$staging/folder.zip"
+            fi
             ;;
         esac
     ' sh "$@"
@@ -358,6 +379,15 @@ case "${1:-}" in
         [ "$#" -eq 2 ] || usage
         filename "$2"
         as_user pluto-tool cat -- "/var/lib/pluto-workspace/$2"
+        ;;
+    remove)
+        [ "$#" -eq 3 ] || usage
+        case "$2" in
+            --file|--folder) ;;
+            *) usage ;;
+        esac
+        folder_path "$3"
+        workspace_access "remove-${2#--}" "$workspace_path"
         ;;
     forward-model)
         [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage

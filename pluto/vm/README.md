@@ -378,6 +378,8 @@ Pluto VM uses 2 CPUs, 512 MiB RAM, and a sparse 4 GiB disk by default. It has ou
 
 In Pluto Desktop, connect to a VM and open **Files**. Open a workspace folder to browse its contents. **Import File** and **Import Folder** copy from your Mac into the open folder. Select a file or folder and choose **Export Selected** to save it on your Mac. Folder exports are ZIPs.
 
+Choose **Remove Selected** to permanently remove a file or folder from the VM workspace. The confirmation shows the VM and item path. Removing a folder also removes its contents.
+
 Run these commands from the repository root on your Mac. Replace `plutoVM` with the instance name in **Settings → Connection**. The default instance name is `pluto`. Start the VM if it’s stopped.
 
 ```sh
@@ -385,7 +387,7 @@ export PLUTO_INSTANCE=plutoVM
 pluto/vm/vm start
 ```
 
-New VM installs include `zip` and `unzip`. If your VM was set up before folder transfers were added, install the utilities once.
+New VM installs include `zip` and `unzip`. If a folder export reports that `zip` is missing, run this one-time setup for that VM, then retry the export.
 
 ```sh
 export LIMA_HOME="${PLUTO_LIMA_HOME:-$HOME/.pluto-lima}"

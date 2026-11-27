@@ -207,6 +207,20 @@ name = "vm-fixture"
         duplicate = subprocess.run([VM, "import", "--path", mcp, file_path], capture_output=True)
         assert duplicate.returncode != 0
         assert vm("export", "--path", file_path, capture_output=True).stdout == csv.read_bytes()
+        for option, path in (
+            ("--file", relative),
+            ("--folder", file_path),
+            ("--folder", f"{relative}/outside"),
+            ("--folder", f"{relative}/outside/anything"),
+            ("--folder", "/var/lib/pluto-workspace/"),
+        ):
+            rejected = subprocess.run([VM, "remove", option, path], capture_output=True)
+            assert rejected.returncode != 0, path
+        vm("remove", "--file", file_path)
+        assert b"Report with spaces.csv" not in vm("list-files", relative, capture_output=True).stdout
+        vm("remove", "--folder", relative)
+        assert b"Project One" not in vm("list-files", f"{workspace_name}/projects", capture_output=True).stdout
+        assert b"Project Two" in vm("list-files", f"{workspace_name}/archive", capture_output=True).stdout
         vm("configure", config)
         previous = first_response({"type": "model_settings"})["models"]
         models = {**previous, "openai": {**previous["openai"], "name": "updated-vm-fixture"}}
