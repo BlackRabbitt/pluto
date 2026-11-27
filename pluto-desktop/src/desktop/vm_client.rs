@@ -1,18 +1,20 @@
 use super::{
-    ApprovalDecision, ApprovalRequest, ChatComposer, CommonMarkCache, Desktop, Lookup,
-    PickerCatalog, chat_list, chat_title, chat_transcript, context_usage, egui, field,
-    thinking_picker, tool_approval_dialog, vm_settings::VmSettingsForm,
+    ApprovalDecision, ApprovalRequest, ChatActivity, ChatComposer, CommonMarkCache, Desktop,
+    Lookup, PickerCatalog, chat_list, chat_title, chat_transcript, context_usage, egui, field,
+    thinking_picker, tool_approval_dialog, vm_files::VmFiles, vm_settings::VmSettingsForm,
 };
 use anyhow::{Context, Result, bail, ensure};
 use pluto::{
     agent::{TokenUsage, ToolProgress, TurnSelection},
-    api::{ApprovalScope, ChatSummary, ChatUpdate, Request, Response, read_message, write_message},
+    api::{
+        ApprovalScope, ChatActivityUpdate, ChatSummary, ChatUpdate, Request, Response,
+        read_message, write_message,
+    },
     history::ChatHistory,
     providers::{Provider, ThinkingLevel, ThinkingSetting},
     tools::{ApprovalRule, Config, ModelMode, valid_name},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
     process::Stdio,
@@ -283,7 +285,7 @@ fn lima_command() -> Result<Command> {
     Ok(command)
 }
 
-async fn create_vm(instance: String) -> Result<()> {
+pub(super) fn vm_helper_command(instance: &str) -> Result<Command> {
     let lima = lima_executable()?;
     let resources = "Contents/Resources/pluto";
     let executable = std::env::current_exe()?;
@@ -311,10 +313,18 @@ async fn create_vm(instance: String) -> Result<()> {
                 .flat_map(std::env::split_paths),
         ),
     )?;
-    let output = Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .arg(helper)
-        .args(["create", &instance])
+        .env("PLUTO_INSTANCE", instance)
         .env("PATH", path)
+        .kill_on_drop(true);
+    Ok(command)
+}
+
+async fn create_vm(instance: String) -> Result<()> {
+    let output = vm_helper_command(&instance)?
+        .args(["create", &instance])
         .output()
         .await
         .context("Could not start the Pluto VM installer")?;
@@ -554,7 +564,7 @@ pub(super) struct VmClient {
     context_usage: Option<TokenUsage>,
     tool_progress: Option<ToolProgress>,
     switched_model: Option<(Provider, Option<u64>)>,
-    loaded_skills: BTreeMap<usize, BTreeSet<String>>,
+    chat_activity: ChatActivity,
     chat_warnings: Vec<String>,
     saved_approvals: Lookup<Vec<ApprovalRule>>,
     pending_send: Option<(String, TurnSelection)>,
@@ -565,13 +575,21 @@ pub(super) struct VmClient {
     decision: Option<Decision>,
     ready: bool,
     busy: bool,
-    settings: bool,
+    page: VmPage,
+    files: VmFiles,
     picker: VmPicker,
     settings_form: Option<VmSettingsForm>,
     settings_load_attempted: bool,
     settings_status: Option<String>,
     resources: Lookup<VmResources>,
     usage: VmUsageMonitor,
+}
+
+#[derive(PartialEq)]
+enum VmPage {
+    Chat,
+    Files,
+    Settings,
 }
 
 enum ClientEvent {
@@ -625,7 +643,7 @@ impl VmClient {
             context_usage: None,
             tool_progress: None,
             switched_model: None,
-            loaded_skills: BTreeMap::new(),
+            chat_activity: ChatActivity::default(),
             chat_warnings: Vec::new(),
             saved_approvals: Lookup::Idle,
             pending_send: None,
@@ -634,7 +652,8 @@ impl VmClient {
             decision: None,
             ready: false,
             busy: false,
-            settings: false,
+            page: VmPage::Chat,
+            files: VmFiles::default(),
             picker: VmPicker::default(),
             settings_form: None,
             settings_load_attempted: false,
@@ -651,6 +670,7 @@ impl VmClient {
         }
         self.warning = None;
         self.tool_progress = None;
+        self.chat_activity.stop_review();
         self.status = match &request {
             Request::History => "Connecting to Pluto VM…",
             Request::OpenChat { .. } => "Opening saved chat…",
@@ -705,7 +725,7 @@ impl VmClient {
     }
 
     fn new_chat(&mut self) {
-        self.settings = false;
+        self.page = VmPage::Chat;
         self.chat_id = None;
         self.history = ChatHistory::default();
         self.reset_chat();
@@ -718,7 +738,7 @@ impl VmClient {
         self.composer.picker_catalog = Lookup::Idle;
         self.context_usage = None;
         self.switched_model = None;
-        self.loaded_skills.clear();
+        self.chat_activity = ChatActivity::default();
         self.chat_warnings.clear();
     }
 
@@ -746,7 +766,7 @@ impl VmClient {
             self.new_chat();
         }
         if self.archived.is_some()
-            && !self.settings
+            && self.page == VmPage::Chat
             && let Some(chat_id) = &self.chat_id
         {
             let archive = !self.archived_chat();
@@ -777,12 +797,12 @@ impl VmClient {
                 .unwrap_or_default()
                 .iter()
                 .map(|chat| (&chat.id, chat.title.as_str())),
-            self.chat_id.as_ref().filter(|_| !self.settings),
+            self.chat_id.as_ref().filter(|_| self.page == VmPage::Chat),
             enabled,
         )
         .cloned();
         if let Some(chat_id) = selected {
-            self.settings = false;
+            self.page = VmPage::Chat;
             if self.chat_id.as_ref() != Some(&chat_id) {
                 self.request(Request::OpenChat { chat_id }, ui.ctx());
             }
@@ -828,7 +848,7 @@ impl VmClient {
             return;
         }
         if matches!(&self.capabilities, Lookup::Complete(Ok(caps)) if caps.provider.is_none()) {
-            self.settings = true;
+            self.page = VmPage::Settings;
             self.settings_status =
                 Some("Choose a provider, enter its server URL, and select a model.".into());
             return;
@@ -940,7 +960,7 @@ impl VmClient {
             &self.history,
             &mut self.markdown,
             &self.chat_warnings,
-            &self.loaded_skills,
+            &self.chat_activity,
             self.ready,
             |ui| {
                 if let Some(warning) = warning {
@@ -955,7 +975,8 @@ impl VmClient {
                 } else if let Some(tool) = &self.tool_progress {
                     super::tool_progress_ui(ui, tool);
                 } else if busy && !status.is_empty() {
-                    super::chat_progress(ui, status);
+                    let heading = self.chat_activity.review_heading();
+                    super::chat_progress(ui, heading.as_deref().unwrap_or(status));
                 }
             },
         );
@@ -1037,7 +1058,7 @@ impl VmClient {
             }
             ChatUpdate::Skill { name } => {
                 if let Some(index) = self.history.messages().len().checked_sub(1) {
-                    self.loaded_skills.entry(index).or_default().insert(name);
+                    self.chat_activity.skill_loaded(index, name);
                 }
             }
             ChatUpdate::Usage { tokens } => self.context_usage = tokens,
@@ -1217,13 +1238,31 @@ impl eframe::App for VmClient {
                     self.saved_approvals = Lookup::Complete(Ok(rules));
                     self.settings_status = Some("Approval removed".into());
                 }
-                ClientEvent::Response(Response::Status { message, update }) => {
+                ClientEvent::Response(Response::Status {
+                    message,
+                    update,
+                    activity,
+                }) => {
                     if !message.is_empty() {
                         self.status = message;
                         self.tool_progress = None;
+                        self.chat_activity.stop_review();
                     }
                     if let Some(update) = update {
                         self.chat_update(update);
+                    }
+                    if let Some(activity) = activity
+                        && let Some(index) = self.history.messages().len().checked_sub(1)
+                    {
+                        match activity {
+                            ChatActivityUpdate::ToolResult { result } => {
+                                self.tool_progress = None;
+                                self.chat_activity.result(index, result);
+                            }
+                            ChatActivityUpdate::ReviewingToolResults => {
+                                self.chat_activity.start_review(index)
+                            }
+                        }
                     }
                 }
                 ClientEvent::Response(Response::Warning { message, update }) => {
@@ -1235,8 +1274,9 @@ impl eframe::App for VmClient {
                 ClientEvent::Response(_) => {}
                 ClientEvent::Decision(decision) => {
                     if decision.retry {
-                        self.settings = false;
+                        self.page = VmPage::Chat;
                         self.tool_progress = None;
+                        self.chat_activity.stop_review();
                     }
                     self.decision = Some(decision);
                 }
@@ -1244,6 +1284,7 @@ impl eframe::App for VmClient {
                     self.busy = false;
                     self.decision = None;
                     self.tool_progress = None;
+                    self.chat_activity.stop_review();
                     self.status.clear();
                     if let Err(error) = result {
                         if let Some((prompt, selection)) = self.pending_send.take() {
@@ -1269,13 +1310,26 @@ impl eframe::App for VmClient {
             super::desktop_brand(ui, self.logo.as_ref());
             ui.weak(format!("Pluto VM · {}", self.instance));
             ui.add_space(20.0);
-            if ui.selectable_label(!self.settings, "Chat").clicked() {
-                self.settings = false;
+            if ui
+                .selectable_label(self.page == VmPage::Chat, "Chat")
+                .clicked()
+            {
+                self.page = VmPage::Chat;
             }
-            if ui.selectable_label(self.settings, "Settings").clicked() && !self.settings {
+            if ui
+                .selectable_label(self.page == VmPage::Files, "Files")
+                .clicked()
+            {
+                self.page = VmPage::Files;
+            }
+            if ui
+                .selectable_label(self.page == VmPage::Settings, "Settings")
+                .clicked()
+                && self.page != VmPage::Settings
+            {
                 self.picker.refresh();
                 self.resources = Lookup::Idle;
-                self.settings = true;
+                self.page = VmPage::Settings;
             }
             self.chat_navigation(ui);
             if let Some(form) = &self.settings_form {
@@ -1283,7 +1337,7 @@ impl eframe::App for VmClient {
                 super::tool_counts_ui(ui, skills, servers);
             }
         });
-        if self.settings {
+        if self.page == VmPage::Settings {
             if self.ready && !self.busy && !self.settings_load_attempted {
                 self.request(Request::VmSettings, context);
             }
@@ -1302,6 +1356,18 @@ impl eframe::App for VmClient {
             return;
         }
         self.usage = VmUsageMonitor::default();
+        if self.page == VmPage::Files {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::central_panel(&context.style())
+                        .inner_margin(egui::Margin::same(24)),
+                )
+                .show(context, |ui| {
+                    self.files.show(ui, &self.runtime, &self.instance)
+                });
+            self.approval(context);
+            return;
+        }
         if self.ready
             && !self.busy
             && self.archived.is_some()

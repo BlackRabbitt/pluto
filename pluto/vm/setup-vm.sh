@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-apk add --no-progress sudo ca-certificates
+apk add --no-progress sudo ca-certificates zip unzip
 id pluto-api >/dev/null 2>&1 || adduser -D -H -s /sbin/nologin -h /var/lib/pluto pluto-api
 id pluto-tool >/dev/null 2>&1 || adduser -D -H -s /sbin/nologin -h /var/lib/pluto-workspace pluto-tool
 

@@ -7,6 +7,7 @@ import threading
 import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from zipfile import ZipFile
 
 from fixture import Handler, tool_call
 
@@ -132,8 +133,8 @@ def api(request, approvals=(), updates=None):
                 else:
                     decision["accept"] = answer
                 send(decision)
-            elif updates is not None and "update" in event:
-                updates.append(event["update"])
+            elif updates is not None and ("update" in event or "activity" in event):
+                updates.append(event.get("update") or event["activity"])
             elif kind == "history":
                 history = event
                 chats = event.get("chats", chats)
@@ -172,6 +173,54 @@ url = "http://127.0.0.1:{port}/v1"
 name = "vm-fixture"
 """)
         vm("start")
+        folder = directory / "source folder"
+        (folder / "empty").mkdir(parents=True)
+        (folder / ".hidden").write_bytes(b"folder transfer\n")
+        (folder / "link").symlink_to(".hidden")
+        (folder / "outside").symlink_to("/tmp")
+        workspace_name = f"Smoke's folder {directory.name}"
+        relative = f"{workspace_name}/projects/Project One"
+        absolute = f"/var/lib/pluto-workspace/{workspace_name}/archive/Project Two"
+        for destination, export_path, name in (
+            (relative, f"/var/lib/pluto-workspace/{relative}/", "Project One"),
+            (absolute, f"{workspace_name}/archive/Project Two", "Project Two"),
+        ):
+            vm("import", "--folder", folder, destination)
+            archive = directory / f"{name}.zip"
+            with archive.open("wb") as output:
+                vm("export", "--folder", export_path, stdout=output)
+            with ZipFile(archive) as exported:
+                assert exported.read(f"{name}/.hidden") == b"folder transfer\n"
+                assert exported.getinfo(f"{name}/empty/").is_dir()
+                assert exported.read(f"{name}/link") == b".hidden"
+        for command in (("import", "--folder", folder), ("export", "--folder")):
+            escape = subprocess.run([VM, *command, f"{relative}/outside/escape"], capture_output=True)
+            assert escape.returncode != 0 and b"outside the workspace" in escape.stderr, escape.stderr
+        items = vm("list-files", relative, capture_output=True).stdout.split(b"\0")
+        assert items.pop() == b""
+        assert set(zip(items[::2], items[1::2], strict=True)) == {
+            (b"d", b"empty"), (b"f", b".hidden"),
+        }
+        file_path = f"{relative}/Report with spaces.csv"
+        vm("import", "--path", csv, file_path)
+        assert vm("export", "--path", file_path, capture_output=True).stdout == csv.read_bytes()
+        duplicate = subprocess.run([VM, "import", "--path", mcp, file_path], capture_output=True)
+        assert duplicate.returncode != 0
+        assert vm("export", "--path", file_path, capture_output=True).stdout == csv.read_bytes()
+        for option, path in (
+            ("--file", relative),
+            ("--folder", file_path),
+            ("--folder", f"{relative}/outside"),
+            ("--folder", f"{relative}/outside/anything"),
+            ("--folder", "/var/lib/pluto-workspace/"),
+        ):
+            rejected = subprocess.run([VM, "remove", option, path], capture_output=True)
+            assert rejected.returncode != 0, path
+        vm("remove", "--file", file_path)
+        assert b"Report with spaces.csv" not in vm("list-files", relative, capture_output=True).stdout
+        vm("remove", "--folder", relative)
+        assert b"Project One" not in vm("list-files", f"{workspace_name}/projects", capture_output=True).stdout
+        assert b"Project Two" in vm("list-files", f"{workspace_name}/archive", capture_output=True).stdout
         vm("configure", config)
         previous = first_response({"type": "model_settings"})["models"]
         models = {**previous, "openai": {**previous["openai"], "name": "updated-vm-fixture"}}
@@ -220,6 +269,10 @@ name = "vm-fixture"
                 assert {"kind": "skill", "name": "vm-smoke-skill"} in updates, updates
                 assert {"kind": "usage", "tokens": {"input": 47, "output": 11}} in updates, updates
                 assert any(update["kind"] == "tool" for update in updates), updates
+                results = [update["result"] for update in updates if update["kind"] == "tool_result"]
+                assert any(result["loaded_skill"] and result["activity"]["name"] == "vm-smoke-skill" for result in results)
+                assert any("books,25" in result["output"] for result in results)
+                assert any(update["kind"] == "reviewing_tool_results" for update in updates)
                 new_id, new_messages, chats = api({"type": "send_chat", "chat_id": None, "prompt": NEW_PROMPT})
             finally:
                 if tunnel.poll() is None:

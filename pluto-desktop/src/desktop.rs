@@ -4,6 +4,7 @@ mod model_settings;
 mod settings_tabs;
 #[cfg(unix)]
 mod vm_client;
+mod vm_files;
 #[cfg(unix)]
 mod vm_settings;
 
@@ -12,9 +13,9 @@ use agent::{
 };
 use anyhow::{Context, Result};
 use chat_ui::{
-    ChatComposer, PickerCatalog, chat_list, chat_progress, chat_title, chat_transcript,
-    chat_warning, context_usage, model_retry_ui, saved_approval_list, thinking_picker,
-    tool_approval_dialog,
+    ChatActivity, ChatComposer, PickerCatalog, chat_list, chat_progress, chat_title,
+    chat_transcript, chat_warning, context_usage, model_retry_ui, saved_approval_list,
+    thinking_picker, tool_approval_dialog,
 };
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -26,7 +27,6 @@ use pluto::{ASSISTANT_NAME, agent, diagnostics, history, model_fallback, provide
 use providers::{Connection, ModelCapabilities, Provider, ThinkingSetting};
 use settings_tabs::SettingsPage;
 use std::{
-    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
@@ -304,24 +304,18 @@ fn thinking_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 fn tool_progress_ui(ui: &mut egui::Ui, tool: &ToolProgress) {
     let status = match tool.phase {
         ToolPhase::AwaitingApproval => "Waiting for approval",
-        ToolPhase::Running => "Waiting for result",
-        ToolPhase::AutoApproved => "Waiting for result · Auto-approved",
-        ToolPhase::GloballyAutoApproved => "Waiting for result · Auto-approved · Global setting",
+        ToolPhase::Running => "Running",
+        ToolPhase::AutoApproved => "Running · Auto-approved",
+        ToolPhase::GloballyAutoApproved => "Running · Auto-approved · Global setting",
     };
     let elapsed = tool.started.elapsed().as_secs();
-    let details = match &tool.activity.action {
-        Some(action) => format!("{action} · {status} · {elapsed}s"),
-        None => format!("{status} · {elapsed}s"),
-    };
-    ui.horizontal_top(|ui| {
+    let details = format!("{} · {status} · {elapsed}s", tool.activity);
+    ui.horizontal(|ui| {
         if tool.phase != ToolPhase::AwaitingApproval {
             ui.spinner();
         }
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.add(egui::Label::new(RichText::new(&tool.activity.name).small().strong()).wrap());
-            ui.add(egui::Label::new(RichText::new(details).small().weak()).wrap());
-        });
+        ui.add(egui::Label::new(RichText::new(&details).small()).truncate())
+            .on_hover_text(details);
     });
     ui.ctx().request_repaint_after(Duration::from_secs(1));
 }
@@ -729,6 +723,33 @@ mod chat_layout_tests {
                 < find_label(&labels, "Fixture verified.").y
         );
 
+        let result_output = "Found fixture\nSecond line of the result";
+        desktop.chat_activity.result(
+            0,
+            agent::ToolResult {
+                activity: tools::ToolActivity {
+                    name: "fixture / lookup".into(),
+                    action: None,
+                },
+                output: result_output.into(),
+                loaded_skill: false,
+            },
+        );
+        desktop.chat_activity.start_review(0);
+        let labels = render(&mut desktop, Vec::new());
+        assert!(!labels.iter().any(|(label, _)| label == result_output));
+        let row = find_label(
+            &labels,
+            "▸ Reviewing result · fixture / lookup · Found fixture…",
+        );
+        render(&mut desktop, click(row));
+        find_label(&render(&mut desktop, Vec::new()), result_output);
+        desktop.chat_activity.stop_review();
+        find_label(
+            &render(&mut desktop, Vec::new()),
+            "▾ Result · fixture / lookup · Found fixture…",
+        );
+
         desktop.tool_progress = Some(ToolProgress {
             activity: tools::ToolActivity {
                 name: "fixture / lookup".into(),
@@ -737,15 +758,13 @@ mod chat_layout_tests {
             phase: ToolPhase::GloballyAutoApproved,
             started: std::time::Instant::now() - Duration::from_secs(8),
         });
+        render(&mut desktop, Vec::new());
         let labels = render(&mut desktop, Vec::new());
-        let name = find_label(&labels, "fixture / lookup");
-        let (seconds, details) = labels.iter().find_map(|(label, position)| {
-            let seconds = label.strip_prefix("Look up the fixture · Waiting for result · Auto-approved · Global setting · ")?
-                .strip_suffix('s')?.parse::<u64>().ok()?;
-            Some((seconds, position))
-        }).context("Missing running tool details")?;
+        let seconds = labels.iter().find_map(|(label, _)| {
+            label.strip_prefix("fixture / lookup · Look up the fixture · Running · Auto-approved · Global setting · ")?
+                .strip_suffix('s')?.parse::<u64>().ok()
+        }).with_context(|| format!("Missing running tool details in {labels:?}"))?;
         assert!(seconds >= 8);
-        assert!(name.y < details.y);
         desktop
             .tool_progress
             .as_mut()
@@ -989,7 +1008,7 @@ struct Desktop {
     busy: bool,
     status: ChatStatus,
     tool_progress: Option<ToolProgress>,
-    loaded_skills: BTreeMap<usize, BTreeSet<String>>,
+    chat_activity: ChatActivity,
     notice: String,
     connection_errors: Vec<String>,
     config_error: bool,
@@ -1122,7 +1141,7 @@ impl Desktop {
             busy: false,
             status: ChatStatus::Idle,
             tool_progress: None,
-            loaded_skills: BTreeMap::new(),
+            chat_activity: ChatActivity::default(),
             connection_errors: Vec::new(),
             approval: None,
             skill_path: String::new(),
@@ -1256,7 +1275,7 @@ impl Desktop {
         self.composer.selection = TurnSelection::default();
         self.composer.picker_catalog = Lookup::Idle;
         self.history = history;
-        self.loaded_skills.clear();
+        self.chat_activity = ChatActivity::default();
         self.context_usage = None;
         self.switched_model = None;
         self.status = ChatStatus::Idle;
@@ -1771,9 +1790,16 @@ impl eframe::App for Desktop {
                 Event::ModelRequest(phase) => {
                     self.status = ChatStatus::ModelRequest(phase);
                     self.tool_progress = None;
+                    self.chat_activity.stop_review();
+                    if matches!(phase, ModelPhase::ReviewingToolResults)
+                        && let Some(index) = self.history.messages().len().checked_sub(1)
+                    {
+                        self.chat_activity.start_review(index);
+                    }
                 }
                 Event::ModelRequestFailed(error, retry) => {
                     self.status = ChatStatus::ModelRequestFailed(error, retry);
+                    self.chat_activity.stop_review();
                 }
                 Event::ModelSwitched {
                     model,
@@ -1788,10 +1814,19 @@ impl eframe::App for Desktop {
                         provider.label()
                     ));
                 }
-                Event::Tool(tool) => self.tool_progress = Some(tool),
+                Event::Tool(tool) => {
+                    self.chat_activity.stop_review();
+                    self.tool_progress = Some(tool);
+                }
+                Event::ToolResult(result) => {
+                    self.tool_progress = None;
+                    if let Some(index) = self.history.messages().len().checked_sub(1) {
+                        self.chat_activity.result(index, result);
+                    }
+                }
                 Event::SkillLoaded(name) => {
                     if let Some(index) = self.history.messages().len().checked_sub(1) {
-                        self.loaded_skills.entry(index).or_default().insert(name);
+                        self.chat_activity.skill_loaded(index, name);
                     }
                 }
                 Event::Warning(warning) => self.connection_errors.push(warning),
@@ -1826,6 +1861,7 @@ impl eframe::App for Desktop {
                     self.busy = false;
                     self.status = ChatStatus::Idle;
                     self.tool_progress = None;
+                    self.chat_activity.stop_review();
                     match result {
                         Ok(answer) => {
                             self.history.push("assistant", answer);
@@ -1908,7 +1944,7 @@ impl Desktop {
                     &self.history,
                     &mut self.markdown_cache,
                     &self.connection_errors,
-                    &self.loaded_skills,
+                    &self.chat_activity,
                     true,
                     |ui| {
                         if let Some(tool) = &self.tool_progress {
@@ -1927,7 +1963,8 @@ impl Desktop {
                                             "Writing a partial answer…"
                                         }
                                     };
-                                    chat_progress(ui, label);
+                                    let heading = self.chat_activity.review_heading();
+                                    chat_progress(ui, heading.as_deref().unwrap_or(label));
                                 }
                                 ChatStatus::Error(status) => chat_warning(ui, status),
                                 ChatStatus::ModelRequestFailed(status, _) => {

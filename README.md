@@ -26,6 +26,7 @@
 | Add skills or MCP servers and manage approvals | [Skills and tools](docs/tools.md) |
 | Find settings, chats, or diagnostic logs | [Troubleshooting](docs/troubleshooting.md) |
 | Set up or operate the Linux guest | [Pluto VM guide](pluto/vm/README.md) |
+| Transfer files or folders between your Mac and a VM | [VM import and export](pluto/vm/README.md#run-and-move-files) |
 | Open a VM shell or set environment variables for models and tools | [VM environment variables](pluto/vm/README.md#environment-variables-in-pluto-vm) |
 | Find source files, symbols, and focused tests | [Development guide](DEVELOPMENT.md) |
 | Understand the sandbox design and benchmarks | [Sandboxing research](research/SANDBOXING.md) |

@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail, ensure};
 use pluto::{
     agent::{self, ApprovalDecision, Event, ModelPhase, ToolPhase, TurnSelection},
-    api::{ApprovalScope, ChatSummary, ChatUpdate, Request, Response, read_message, write_message},
+    api::{
+        ApprovalScope, ChatActivityUpdate, ChatSummary, ChatUpdate, Request, Response,
+        read_message, write_message,
+    },
     diagnostics::{self, LogSender, Trace},
     history::{ChatEntry, ChatHistory, ChatStore},
     model_fallback::ModelCooldowns,
@@ -537,6 +540,8 @@ impl Service {
                         Response::Status {
                             message: message.into(),
                             update: None,
+                            activity: matches!(phase, ModelPhase::ReviewingToolResults)
+                                .then_some(ChatActivityUpdate::ReviewingToolResults),
                         }
                     }
                     Event::Tool(tool) => {
@@ -553,15 +558,23 @@ impl Service {
                                 activity: tool.activity,
                                 phase: tool.phase,
                             }),
+                            activity: None,
                         }
                     }
                     Event::SkillLoaded(name) => Response::Status {
                         message: format!("Loaded skill · {name}"),
                         update: Some(ChatUpdate::Skill { name }),
+                        activity: None,
+                    },
+                    Event::ToolResult(result) => Response::Status {
+                        message: String::new(),
+                        update: None,
+                        activity: Some(ChatActivityUpdate::ToolResult { result }),
                     },
                     Event::Usage { tokens, .. } => Response::Status {
                         message: String::new(),
                         update: Some(ChatUpdate::Usage { tokens }),
+                        activity: None,
                     },
                     Event::ModelSwitched {
                         model,

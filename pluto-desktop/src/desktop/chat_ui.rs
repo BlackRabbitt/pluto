@@ -3,12 +3,15 @@ use super::{
 };
 use eframe::egui::{self, Frame, Margin, RichText, TextEdit};
 use pluto::{
-    agent::{TokenUsage, TurnSelection},
+    agent::{TokenUsage, ToolResult, TurnSelection},
     history::ChatHistory,
     providers::{ThinkingLevel, ThinkingSetting},
     tools::McpToolId,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
 
 const CHAT_DRAFT_HEIGHT: f32 = 80.0;
 const CHAT_PICKER_HEIGHT: f32 = 155.0;
@@ -306,13 +309,178 @@ impl ChatComposer {
     }
 }
 
+#[derive(Default)]
+pub(super) struct ChatActivity {
+    turns: BTreeMap<usize, TurnActivity>,
+    active_review: Option<usize>,
+}
+
+#[derive(Default)]
+struct TurnActivity {
+    skills: BTreeSet<String>,
+    results: Vec<ResultRow>,
+    reviewed: Range<usize>,
+}
+
+struct ResultRow {
+    result: ToolResult,
+    preview: String,
+}
+
+impl ChatActivity {
+    pub(super) fn skill_loaded(&mut self, index: usize, name: String) {
+        self.turns.entry(index).or_default().skills.insert(name);
+    }
+
+    pub(super) fn result(&mut self, index: usize, result: ToolResult) {
+        self.stop_review();
+        let turn = self.turns.entry(index).or_default();
+        if result.loaded_skill {
+            turn.skills.remove(&result.activity.name);
+        }
+        let preview = if result.loaded_skill {
+            String::new()
+        } else {
+            result_preview(&result.output)
+        };
+        turn.results.push(ResultRow { result, preview });
+    }
+
+    pub(super) fn start_review(&mut self, index: usize) {
+        if let Some(turn) = self.turns.get_mut(&index) {
+            if turn.reviewed.end < turn.results.len() {
+                turn.reviewed = turn.reviewed.end..turn.results.len();
+            }
+            self.active_review = Some(index);
+        }
+    }
+
+    pub(super) fn stop_review(&mut self) {
+        self.active_review = None;
+    }
+
+    pub(super) fn review_heading(&self) -> Option<String> {
+        let count = self.turns.get(&self.active_review?)?.reviewed.len();
+        (count > 1).then(|| format!("Reviewing {count} results…"))
+    }
+
+    fn show(&self, ui: &mut egui::Ui, chat_id: &impl std::hash::Hash, index: usize) {
+        let Some(turn) = self.turns.get(&index) else {
+            return;
+        };
+        for name in &turn.skills {
+            ui.add(
+                egui::Label::new(RichText::new(format!("Loaded skill · {name}")).small())
+                    .truncate(),
+            );
+        }
+        for (position, row) in turn.results.iter().enumerate() {
+            let result = &row.result;
+            let reviewing = self.active_review == Some(index) && turn.reviewed.contains(&position);
+            let summary = if result.loaded_skill {
+                let phase = if reviewing {
+                    " · Reviewing instructions"
+                } else {
+                    ""
+                };
+                format!("Loaded skill · {}{phase}", result.activity.name)
+            } else {
+                let phase = if reviewing {
+                    "Reviewing result"
+                } else {
+                    "Result"
+                };
+                format!("{phase} · {} · {}", result.activity, row.preview)
+            };
+            let id = ui.make_persistent_id(("tool_result", chat_id, index, position));
+            let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
+            let arrow = if open { "▾" } else { "▸" };
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(format!("{arrow} {summary}")).small())
+                        .frame(false)
+                        .truncate(),
+                )
+                .on_hover_text(&summary)
+                .clicked()
+            {
+                open = !open;
+                ui.data_mut(|data| data.insert_temp(id, open));
+            }
+            if open {
+                egui::ScrollArea::both()
+                    .id_salt(id)
+                    .max_height(190.0)
+                    .show(ui, |ui| {
+                        let output = if result.output.is_empty() {
+                            "No output"
+                        } else {
+                            &result.output
+                        };
+                        ui.add(
+                            egui::Label::new(RichText::new(output).monospace())
+                                .wrap_mode(egui::TextWrapMode::Extend)
+                                .selectable(true),
+                        );
+                    });
+            }
+        }
+    }
+}
+
+fn result_preview(output: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
+        && let (Some(exit_code), Some(stdout), Some(stderr)) = (
+            value.get("exit_code"),
+            value["stdout"].as_str(),
+            value["stderr"].as_str(),
+        )
+        && (exit_code.is_number() || exit_code.is_null())
+    {
+        let text = if stdout.trim().is_empty() {
+            stderr
+        } else {
+            stdout
+        };
+        let preview = output_preview(text);
+        return match exit_code.as_i64() {
+            Some(0) => preview,
+            Some(code) => format!("Exit {code} · {preview}"),
+            None => format!("Command terminated · {preview}"),
+        };
+    }
+    output_preview(output)
+}
+
+fn output_preview(output: &str) -> String {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(line) = lines.next() else {
+        return "No output".into();
+    };
+    let end = line
+        .char_indices()
+        .nth(100)
+        .map_or(line.len(), |(end, _)| end);
+    let mut preview: String = line[..end]
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if end < line.len() || lines.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
 pub(super) fn chat_transcript(
     ui: &mut egui::Ui,
     id: impl std::hash::Hash,
     history: &ChatHistory,
     markdown: &mut CommonMarkCache,
     warnings: &[String],
-    loaded_skills: &BTreeMap<usize, BTreeSet<String>>,
+    activity: &ChatActivity,
     show_empty: bool,
     status: impl FnOnce(&mut egui::Ui),
 ) {
@@ -340,18 +508,7 @@ pub(super) fn chat_transcript(
                     history.timestamp(index),
                     markdown,
                 );
-                if let Some(skills) = loaded_skills.get(&index) {
-                    for name in skills {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("Skill loaded · {name}"))
-                                    .small()
-                                    .color(ui.visuals().hyperlink_color),
-                            )
-                            .wrap(),
-                        );
-                    }
-                }
+                activity.show(ui, &id, index);
             }
             status(ui);
         });
